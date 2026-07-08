@@ -1,0 +1,125 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="900" viewBox="0 0 960 900" font-family="ui-sans-serif, system-ui, sans-serif">
+  <rect width="960" height="900" fill="#0f1115"/>
+  <text x="30" y="40" fill="#e6e6e6" font-size="26" font-weight="700">Trail-cam leaf — wiring</text>
+  <text x="30" y="66" fill="#9aa4b2" font-size="14">Freenove ESP32-S3-WROOM CAM  ·  Waveshare Core1262 (SX1262)</text>
+
+  <!-- ============ PANEL A: bench radio test (9 wires) ============ -->
+  <text x="30" y="108" fill="#7ee787" font-size="16" font-weight="700">① BENCH RADIO TEST — solder these 9 now</text>
+  <text x="30" y="128" fill="#9aa4b2" font-size="12.5">Antenna on the Core1262 u.FL BEFORE power. Keep SCK / BUSY / DIO1 short (&lt;15 cm).</text>
+
+  <!-- Freenove box -->
+  <rect x="70" y="150" width="210" height="440" rx="10" fill="#161b22" stroke="#30363d" stroke-width="2"/>
+  <text x="175" y="176" fill="#e6e6e6" font-size="15" font-weight="700" text-anchor="middle">Freenove</text>
+  <text x="175" y="194" fill="#9aa4b2" font-size="11.5" text-anchor="middle">ESP32-S3</text>
+  <text x="175" y="560" fill="#8b949e" font-size="11" text-anchor="middle">USB (UART) for</text>
+  <text x="175" y="575" fill="#8b949e" font-size="11" text-anchor="middle">flash + serial</text>
+
+  <!-- Core1262 box -->
+  <rect x="680" y="150" width="210" height="440" rx="10" fill="#161b22" stroke="#30363d" stroke-width="2"/>
+  <text x="785" y="176" fill="#e6e6e6" font-size="15" font-weight="700" text-anchor="middle">Core1262</text>
+  <text x="785" y="194" fill="#9aa4b2" font-size="11.5" text-anchor="middle">SX1262 pads</text>
+  <circle cx="865" cy="172" r="7" fill="none" stroke="#f0883e" stroke-width="2"/>
+  <text x="845" y="215" fill="#f0883e" font-size="10.5" text-anchor="middle">u.FL ant</text>
+
+  <!-- wire rows: y positions -->
+  <!-- helper: each row = line from (280,y) to (680,y), left label GPIO, right label pad -->
+
+  <!-- VCC -->
+  <line x1="280" y1="230" x2="680" y2="230" stroke="#f85149" stroke-width="3.5"/>
+  <text x="272" y="226" fill="#e6e6e6" font-size="13" text-anchor="end">3V3</text>
+  <text x="688" y="226" fill="#e6e6e6" font-size="13">VCC</text>
+  <text x="480" y="222" fill="#f85149" font-size="11.5" text-anchor="middle" font-weight="600">power 3.3 V</text>
+
+  <!-- GND -->
+  <line x1="280" y1="270" x2="680" y2="270" stroke="#8b949e" stroke-width="3.5"/>
+  <text x="272" y="266" fill="#e6e6e6" font-size="13" text-anchor="end">GND</text>
+  <text x="688" y="266" fill="#e6e6e6" font-size="13">GND</text>
+  <text x="480" y="262" fill="#8b949e" font-size="11.5" text-anchor="middle" font-weight="600">ground</text>
+
+  <!-- SCK -->
+  <line x1="280" y1="310" x2="680" y2="310" stroke="#e3b341" stroke-width="3.5"/>
+  <text x="272" y="306" fill="#e6e6e6" font-size="13" text-anchor="end">GPIO47</text>
+  <text x="688" y="306" fill="#e6e6e6" font-size="13">SCK / CLK</text>
+  <text x="480" y="302" fill="#e3b341" font-size="11.5" text-anchor="middle" font-weight="600">SPI clock ✂ short</text>
+
+  <!-- MOSI -->
+  <line x1="280" y1="350" x2="680" y2="350" stroke="#7ee787" stroke-width="3.5"/>
+  <text x="272" y="346" fill="#e6e6e6" font-size="13" text-anchor="end">GPIO48</text>
+  <text x="688" y="346" fill="#e6e6e6" font-size="13">MOSI / DIN</text>
+  <text x="480" y="342" fill="#7ee787" font-size="11.5" text-anchor="middle" font-weight="600">SPI data →</text>
+
+  <!-- MISO -->
+  <line x1="280" y1="390" x2="680" y2="390" stroke="#58a6ff" stroke-width="3.5"/>
+  <text x="272" y="386" fill="#58a6ff" font-size="13" text-anchor="end" font-weight="700">GPIO38</text>
+  <text x="688" y="386" fill="#e6e6e6" font-size="13">MISO / DO</text>
+  <text x="480" y="382" fill="#58a6ff" font-size="11.5" text-anchor="middle" font-weight="600">SPI data ←  (NOT 21!)</text>
+
+  <!-- NSS -->
+  <line x1="280" y1="430" x2="680" y2="430" stroke="#f0883e" stroke-width="3.5"/>
+  <text x="272" y="426" fill="#e6e6e6" font-size="13" text-anchor="end">GPIO14</text>
+  <text x="688" y="426" fill="#e6e6e6" font-size="13">NSS / CS</text>
+  <text x="480" y="422" fill="#f0883e" font-size="11.5" text-anchor="middle" font-weight="600">chip select</text>
+
+  <!-- RST -->
+  <line x1="280" y1="470" x2="680" y2="470" stroke="#c9d1d9" stroke-width="3.5"/>
+  <text x="272" y="466" fill="#e6e6e6" font-size="13" text-anchor="end">GPIO1</text>
+  <text x="688" y="466" fill="#e6e6e6" font-size="13">RST</text>
+  <text x="480" y="462" fill="#c9d1d9" font-size="11.5" text-anchor="middle" font-weight="600">reset</text>
+
+  <!-- BUSY -->
+  <line x1="280" y1="510" x2="680" y2="510" stroke="#bc8cff" stroke-width="3.5"/>
+  <text x="272" y="506" fill="#e6e6e6" font-size="13" text-anchor="end">GPIO2</text>
+  <text x="688" y="506" fill="#e6e6e6" font-size="13">BUSY</text>
+  <text x="480" y="502" fill="#bc8cff" font-size="11.5" text-anchor="middle" font-weight="600">busy ✂ short</text>
+
+  <!-- DIO1 -->
+  <line x1="280" y1="550" x2="680" y2="550" stroke="#39c5cf" stroke-width="3.5"/>
+  <text x="272" y="546" fill="#e6e6e6" font-size="13" text-anchor="end">GPIO42</text>
+  <text x="688" y="546" fill="#e6e6e6" font-size="13">DIO1</text>
+  <text x="480" y="542" fill="#39c5cf" font-size="11.5" text-anchor="middle" font-weight="600">irq ✂ short</text>
+
+  <!-- pin dots -->
+  <g fill="#30363d">
+    <circle cx="280" cy="230" r="4"/><circle cx="280" cy="270" r="4"/><circle cx="280" cy="310" r="4"/><circle cx="280" cy="350" r="4"/><circle cx="280" cy="390" r="4"/><circle cx="280" cy="430" r="4"/><circle cx="280" cy="470" r="4"/><circle cx="280" cy="510" r="4"/><circle cx="280" cy="550" r="4"/>
+    <circle cx="680" cy="230" r="4"/><circle cx="680" cy="270" r="4"/><circle cx="680" cy="310" r="4"/><circle cx="680" cy="350" r="4"/><circle cx="680" cy="390" r="4"/><circle cx="680" cy="430" r="4"/><circle cx="680" cy="470" r="4"/><circle cx="680" cy="510" r="4"/><circle cx="680" cy="550" r="4"/>
+  </g>
+
+  <!-- divider -->
+  <line x1="30" y1="628" x2="930" y2="628" stroke="#30363d" stroke-width="1.5" stroke-dasharray="4 4"/>
+
+  <!-- ============ PANEL B: deployed leaf additions ============ -->
+  <text x="30" y="662" fill="#d29922" font-size="16" font-weight="700">② DEPLOYED LEAF — add later, do NOT wire for the bench test</text>
+  <text x="30" y="682" fill="#9aa4b2" font-size="12.5">These use the reserved pins. Dashed = add when building the field node.</text>
+
+  <!-- PIR -->
+  <rect x="70" y="705" width="250" height="150" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1.6" stroke-dasharray="6 4"/>
+  <text x="195" y="730" fill="#e6e6e6" font-size="14" font-weight="700" text-anchor="middle">PIR — AM312</text>
+  <line x1="90" y1="762" x2="300" y2="762" stroke="#f85149" stroke-width="2.5"/><text x="90" y="757" fill="#9aa4b2" font-size="11">VCC→3V3</text>
+  <line x1="90" y1="792" x2="300" y2="792" stroke="#8b949e" stroke-width="2.5"/><text x="90" y="787" fill="#9aa4b2" font-size="11">GND→GND</text>
+  <line x1="90" y1="822" x2="300" y2="822" stroke="#e3b341" stroke-width="2.5"/><text x="90" y="817" fill="#e3b341" font-size="11.5" font-weight="700">OUT→GPIO21</text>
+  <text x="305" y="826" fill="#8b949e" font-size="10.5">ext0 wake</text>
+
+  <!-- Battery divider -->
+  <rect x="355" y="705" width="255" height="150" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1.6" stroke-dasharray="6 4"/>
+  <text x="482" y="730" fill="#e6e6e6" font-size="14" font-weight="700" text-anchor="middle">Battery sense (÷2)</text>
+  <text x="375" y="758" fill="#f85149" font-size="11.5">V+bat</text>
+  <line x1="410" y1="754" x2="460" y2="754" stroke="#f85149" stroke-width="2.5"/>
+  <rect x="460" y="747" width="34" height="14" fill="none" stroke="#c9d1d9" stroke-width="1.4"/><text x="477" y="742" fill="#9aa4b2" font-size="10" text-anchor="middle">100k</text>
+  <line x1="494" y1="754" x2="540" y2="754" stroke="#c9d1d9" stroke-width="2"/>
+  <text x="500" y="778" fill="#58a6ff" font-size="11.5" font-weight="700">tap → GPIO3</text>
+  <text x="500" y="793" fill="#8b949e" font-size="10">(ADC1_CH2)</text>
+  <line x1="540" y1="754" x2="540" y2="800" stroke="#c9d1d9" stroke-width="2"/>
+  <rect x="523" y="800" width="34" height="14" fill="none" stroke="#c9d1d9" stroke-width="1.4"/><text x="540" y="811" fill="#9aa4b2" font-size="10" text-anchor="middle">100k</text>
+  <line x1="540" y1="814" x2="540" y2="836" stroke="#8b949e" stroke-width="2"/><text x="548" y="838" fill="#9aa4b2" font-size="11">GND</text>
+  <text x="375" y="836" fill="#8b949e" font-size="10.5">+0.1µF tap→GND</text>
+
+  <!-- BME280 -->
+  <rect x="645" y="705" width="245" height="150" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1.6" stroke-dasharray="6 4"/>
+  <text x="767" y="730" fill="#e6e6e6" font-size="14" font-weight="700" text-anchor="middle">BME280 (I2C)</text>
+  <line x1="665" y1="762" x2="875" y2="762" stroke="#f85149" stroke-width="2.5"/><text x="665" y="757" fill="#9aa4b2" font-size="11">VCC→3V3</text>
+  <line x1="665" y1="792" x2="875" y2="792" stroke="#8b949e" stroke-width="2.5"/><text x="665" y="787" fill="#9aa4b2" font-size="11">GND→GND</text>
+  <line x1="665" y1="815" x2="875" y2="815" stroke="#58a6ff" stroke-width="2.5"/><text x="665" y="810" fill="#58a6ff" font-size="11.5" font-weight="700">SDA→GPIO40</text>
+  <line x1="665" y1="838" x2="875" y2="838" stroke="#39c5cf" stroke-width="2.5"/><text x="665" y="833" fill="#39c5cf" font-size="11.5" font-weight="700">SCL→GPIO41</text>
+
+  <text x="30" y="884" fill="#6e7681" font-size="11">Reserved pins: 21 PIR · 3 battery ADC · 40/41 BME280 I2C · 39 spare. GPIO21 is why radio MISO moved to 38.</text>
+</svg>

@@ -1,0 +1,29 @@
+# Gate A2 — Pi-side ~/.reticulum/config interface stanzas.
+# Append the relevant [[...]] block under the [interfaces] section of your config
+# (RNS writes a default config on first `rnsd`/import; edit that file).
+
+[interfaces]
+
+  # --- A2a (IP-only interop test) -------------------------------------------------
+  # Pi <-> a single microReticulum board, both on UDP over the LAN. This is the
+  # make-or-break: does the C++ port interop with reference Python RNS at all?
+  # The board runs UDPInterface (default port 4242, LAN broadcast); match it here.
+  [[Gate A2 UDP]]
+    type = UDPInterface
+    interface_enabled = true
+    listen_ip = 0.0.0.0
+    listen_port = 4242
+    # Broadcast on the LAN is simplest (both on one subnet). For a fixed board IP,
+    # set forward_ip to the board's address instead of the broadcast.
+    forward_ip = 255.255.255.255
+    forward_port = 4242
+
+  # --- A2b (full gateway) ---------------------------------------------------------
+  # Same UDP stanza as above. The difference is on the RADIO side, not here: the
+  # gateway BOARD bridges LoRa<->UDP, so the Pi still only ever sees UDP. The leaf's
+  # Resource arrives leaf --LoRa--> gateway-board --UDP--> this Pi. No extra Pi config.
+  #
+  # NOTE: we intentionally do NOT use an RNodeInterface here. microReticulum's
+  # LoRaInterface is a custom L2 framing, not RNode air format, so we bridge at L3
+  # (UDP) rather than mixing two L2s on one radio. That keeps the only cross-impl
+  # surface as UDPInterface<->UDPInterface, the most standard one.

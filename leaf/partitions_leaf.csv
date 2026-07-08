@@ -1,0 +1,15 @@
+# Leaf partition table — 16 MB flash (WROOM-1 N16R8).
+# Dual OTA slots (2026-07-03): the update_firmware command streams a new image into the
+# idle slot while the old one runs, so a bad image auto-rolls-back and USB becomes
+# disaster-recovery only. Head layout unchanged (nvs at 0x9000 -> the RNS identity in
+# NVS survives, as does otadata at 0xe000); LittleFS shrinks 12.9 -> 9.9 MB, which is
+# fine — it's only the no-SD-card fallback store now (SD holds the photo archive).
+# MIGRATION: changing the table moves spiffs -> old LittleFS content is gone; flash
+# this via USB once (partitions bin @0x8000 + app @0x10000 + 0xFF-erase otadata).
+# Name,   Type, SubType,  Offset,   Size
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+app0,     app,  ota_0,    0x10000,  0x300000,
+app1,     app,  ota_1,    0x310000, 0x300000,
+spiffs,   data, spiffs,   0x610000, 0x9E0000,
+coredump, data, coredump, 0xFF0000, 0x10000,
