@@ -35,12 +35,18 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
-#include <WiFi.h>
+#include <WiFi.h>           // WiFiClientSecure/WiFiUDP ride lwIP — they route over ETH too
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <time.h>
+#ifdef GW_HAS_OLED
 #include <U8g2lib.h>        // SSD1306 OLED (parent-facing status screen)
-#include <ArduinoOTA.h>     // WiFi firmware updates (espota) over the WG tunnel
+#endif
+#ifdef GW_NET_ETH
+#include <ETH.h>            // LAN8720 wired ethernet (LILYGO T-Internet-POE)
+#include <UDPInterface.h>   // vendored (lib/udp_interface): RNS-over-UDP on the wire
+#endif
+#include <ArduinoOTA.h>     // network firmware updates (espota) over the WG tunnel
 
 #ifndef GW_SITE
 #define GW_SITE "home"
@@ -57,8 +63,27 @@
 #ifndef GW_OTA_PASS
 #define GW_OTA_PASS "trailcam-ota"     // real value injected from secrets.ini
 #endif
-#if !defined(GW_WIFI_SSID) || !defined(GW_WIFI_PSK) || !defined(GW_INGEST_URL) || !defined(GW_INGEST_TOKEN)
-#error "GW_WIFI_SSID / GW_WIFI_PSK / GW_INGEST_URL / GW_INGEST_TOKEN required — see secrets.ini.example"
+#if !defined(GW_INGEST_URL) || !defined(GW_INGEST_TOKEN)
+#error "GW_INGEST_URL / GW_INGEST_TOKEN required — see secrets.ini.example"
+#endif
+#if !defined(GW_NET_ETH) && (!defined(GW_WIFI_SSID) || !defined(GW_WIFI_PSK))
+#error "GW_WIFI_SSID / GW_WIFI_PSK required for the WiFi build — see secrets.ini.example"
+#endif
+
+// --- network abstraction: the uplink is WiFi (Heltec) or wired ethernet (T-Internet-POE).
+// Everything below the transport (TLS ingest, OTA, NTP, web server) is identical — lwIP
+// doesn't care which interface carries the socket.
+#ifdef GW_NET_ETH
+static volatile bool s_eth_got_ip = false;
+static bool net_up()  { return s_eth_got_ip; }
+static IPAddress net_ip()   { return ETH.localIP(); }
+static int    net_rssi()    { return 0; }              // wired: no meaningful RSSI
+static String net_desc()    { return String("ethernet ") + (s_eth_got_ip ? ETH.linkSpeed() : 0) + "M"; }
+#else
+static bool net_up()  { return WiFi.status() == WL_CONNECTED; }
+static IPAddress net_ip()   { return WiFi.localIP(); }
+static int    net_rssi()    { return (int)WiFi.RSSI(); }
+static String net_desc()    { return WiFi.SSID(); }
 #endif
 
 static const char* APP_NAME = "trailcam_gatea";   // leaves build their OUT destination
@@ -68,6 +93,10 @@ static const char* ASPECT   = "resource";         // from these exact strings �
 // --- RNS plumbing ----------------------------------------------------------------------
 static RNS::Reticulum reticulum({RNS::Type::NONE});
 static RNS::Interface lora_interface({RNS::Type::NONE});
+static bool s_radio_ok = false;   // SX1262 present + init'd; false = ethernet/WiFi-only boot
+#ifdef GW_NET_ETH
+static RNS::Interface udp_interface({RNS::Type::NONE});   // RNS-over-UDP on the wire
+#endif
 static microStore::FileSystem filesystem{microStore::Adapters::UniversalFileSystem()};
 static RNS::Destination gw_destination({RNS::Type::NONE});
 static RNS::Link        latest_link({RNS::Type::NONE});
@@ -136,15 +165,18 @@ static uint32_t s_evt_ms[GW_EVT_SLOTS];
 static int      s_evt_head = 0;   // next write slot; ring is chronological from head
 static struct {
     uint32_t announces = 0, cmds_delivered = 0, resources_ok = 0, resources_fail = 0,
-             chunks = 0, uploads_ok = 0;
+             chunks = 0, uploads_ok = 0, probes = 0;
 } s_stats;
 
 // --- parent-facing OLED (Heltec V3 SSD1306 on I2C 17/18, reset 21, Vext 36) ------------
 // The board's built-in screen, unused until now. Shows a rotating two-page status the
 // the property owner can glance at: "is it working / where to see photos" and "last capture".
 // Pin constants (Vext/RST_OLED/SCL_OLED/SDA_OLED) come from the board variant.
+// The T-Internet-POE has no screen — its glanceable status is the web ring at :80.
+#ifdef GW_HAS_OLED
 static U8G2_SSD1306_128X64_NONAME_F_HW_I2C
     u8g2(U8G2_R0, /*reset=*/RST_OLED, /*clock=*/SCL_OLED, /*data=*/SDA_OLED);
+#endif
 
 // Site display name (the address), fetched from the backend by this gateway's slug
 // and cached in NVS so it shows instantly at boot, even before WiFi/first fetch. A
@@ -285,7 +317,7 @@ static void web_root() {
              "announces %lu | cmds %lu | res ok/fail %lu/%lu | chunks %lu | uploads %lu",
              (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(),
              (unsigned)((LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024), clock,
-             LORA_PROFILES[s_rf.current].name,
+             s_radio_ok ? LORA_PROFILES[s_rf.current].name : "ABSENT — wire the SX1262",
              s_rf.pending != 0xFF ? " (confirming)" : (s_rf.scanning ? " (scanning)" : ""),
              LoRaInterface::last_rssi, LoRaInterface::last_snr,
              (unsigned long)s_stats.announces, (unsigned long)s_stats.cmds_delivered,
@@ -322,7 +354,7 @@ static void queue_beat(const char* fmt, ...) {
 }
 
 static void post_beats() {
-    if (!s_beat_n || WiFi.status() != WL_CONNECTED) return;
+    if (!s_beat_n || !net_up()) return;
     WiFiClientSecure tls;
     tls.setInsecure();
     HTTPClient http;
@@ -609,6 +641,50 @@ static void handle_chunk(const char* hdr, const uint8_t* body, size_t blen,
     }
 }
 
+// --- surveyor probes: proof-of-connection records, never photos --------------------------
+// The surveyor (docs/trailcam/surveyor.md in the homelab tree) pushes dummy Resources with
+// kind=probe and its GPS fix in the envelope. Log the whole header verbatim into a
+// telemetry beat (it's already JSON) with OUR side's RF numbers + airtime, and queue a
+// one-shot probe_ack downlink so the walker's CSV gets the gateway-side numbers too.
+// Never uploaded as a photo, never counted as a capture.
+static char s_probe_ack[192] = "";   // delivered into the surveyor's post-announce RX window
+
+static void handle_probe(const char* hdr, size_t total_len, uint32_t res_ms) {
+    char slug[40] = "";
+    json_str(hdr, "camera", slug, sizeof(slug));
+    const long long seq  = json_ll(hdr, "seq");
+    const long long part = json_ll(hdr, "part");
+    const float rssi = LoRaInterface::last_rssi;
+    const float snr  = LoRaInterface::last_snr;
+    rf_note_leaf_heard();
+    Serial.printf("[gw] PROBE #%lld part %lld from %s: %u bytes in %lu ms "
+                  "(rssi %.0f snr %.1f, %s)\n",
+                  seq, part, slug[0] ? slug : "?", (unsigned)total_len,
+                  (unsigned long)res_ms, rssi, snr, rf_name(s_rf.current));
+    s_stats.probes++;
+    log_event("probe #%lld from %s (%.0f dBm)", seq, slug[0] ? slug : "surveyor", rssi);
+    if (isnan(rssi))
+        queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\","
+                   "\"extra\":{\"probe\":%s,\"ms\":%lu,\"bytes\":%u,\"profile\":\"%s\"}}",
+                   GW_SITE, slug[0] ? slug : "surveyor", hdr,
+                   (unsigned long)res_ms, (unsigned)total_len, rf_name(s_rf.current));
+    else
+        queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\","
+                   "\"rssi\":%.0f,\"snr\":%.1f,"
+                   "\"extra\":{\"probe\":%s,\"ms\":%lu,\"bytes\":%u,\"profile\":\"%s\"}}",
+                   GW_SITE, slug[0] ? slug : "surveyor", rssi, snr, hdr,
+                   (unsigned long)res_ms, (unsigned)total_len, rf_name(s_rf.current));
+    if (isnan(rssi))
+        snprintf(s_probe_ack, sizeof(s_probe_ack),
+                 "{\"kind\":\"probe_ack\",\"payload\":{\"seq\":%lld,\"part\":%lld,"
+                 "\"ms\":%lu}}", seq, part, (unsigned long)res_ms);
+    else
+        snprintf(s_probe_ack, sizeof(s_probe_ack),
+                 "{\"kind\":\"probe_ack\",\"payload\":{\"seq\":%lld,\"part\":%lld,"
+                 "\"rssi\":%.0f,\"snr\":%.1f,\"ms\":%lu}}",
+                 seq, part, rssi, snr, (unsigned long)res_ms);
+}
+
 static void on_resource_concluded(const RNS::Resource& resource) {
     if (resource.status() != RNS::Type::Resource::COMPLETE) {
         Serial.printf("[gw] resource FAILED status=%d\n", (int)resource.status());
@@ -624,7 +700,8 @@ static void on_resource_concluded(const RNS::Resource& resource) {
                   (unsigned)d.size(), resource.get_hash().toHex().c_str());
     s_stats.resources_ok++;
 
-    // Chunked? Peek the envelope for a "chunks" field; multi-chunk goes to reassembly.
+    // Enveloped? Peek the header once: probes are logged (never uploaded), multi-chunk
+    // fulls go to reassembly, everything else uploads as-is.
     if (d.size() > 2 && d.data()[0] == '{') {
         const uint8_t* nl = (const uint8_t*)memchr(d.data(), '\n',
                                                    min(d.size(), (size_t)256));
@@ -633,6 +710,12 @@ static void on_resource_concluded(const RNS::Resource& resource) {
             size_t hl = nl - d.data();
             memcpy(hdr, d.data(), hl);
             hdr[hl] = '\0';
+            char kind[16] = "";
+            json_str(hdr, "kind", kind, sizeof(kind));
+            if (strcmp(kind, "probe") == 0) {
+                handle_probe(hdr, d.size(), millis() - s_res_start_ms);
+                return;
+            }
             if (json_ll(hdr, "chunks") > 1) {
                 handle_chunk(hdr, nl + 1, d.size() - hl - 1,
                              millis() - s_res_start_ms);
@@ -718,7 +801,7 @@ public:
 };
 
 static void poll_commands() {
-    if (WiFi.status() != WL_CONNECTED) return;
+    if (!net_up()) return;
     WiFiClientSecure tls;
     tls.setInsecure();
     HTTPClient http;
@@ -970,6 +1053,41 @@ static void rf_loop() {
     }
 }
 
+#ifdef GW_NET_ETH
+// --- wired ethernet (LILYGO T-Internet-POE, LAN8720) ------------------------------------
+// Pin map proven on the bench 2026-06-30 (bridge-poe Step 1): MDC 23, MDIO 18, PHY addr 0,
+// clock OUT on GPIO17, no power-enable pin. Classic Arduino-ESP32 core 2.x ETH API — the
+// env is pinned to espressif32@6.x for exactly this signature.
+#define GW_ETH_ADDR        0
+#define GW_ETH_POWER_PIN  -1
+#define GW_ETH_MDC_PIN    23
+#define GW_ETH_MDIO_PIN   18
+#define GW_ETH_TYPE       ETH_PHY_LAN8720
+#define GW_ETH_CLK_MODE   ETH_CLOCK_GPIO17_OUT
+
+static void on_eth_event(WiFiEvent_t event) {
+    switch (event) {
+        case ARDUINO_EVENT_ETH_START:     Serial.println("[gw] ETH start"); ETH.setHostname("trailcam-gw"); break;
+        case ARDUINO_EVENT_ETH_CONNECTED: Serial.println("[gw] ETH link up"); break;
+        case ARDUINO_EVENT_ETH_GOT_IP:
+            Serial.printf("[gw] ETH got IP: %s  (%uMbps, %s)\n",
+                          ETH.localIP().toString().c_str(), ETH.linkSpeed(),
+                          ETH.fullDuplex() ? "full" : "half");
+            s_eth_got_ip = true;
+            break;
+        case ARDUINO_EVENT_ETH_DISCONNECTED: Serial.println("[gw] ETH link DOWN"); s_eth_got_ip = false; break;
+        case ARDUINO_EVENT_ETH_STOP:         Serial.println("[gw] ETH stop"); s_eth_got_ip = false; break;
+        default: break;
+    }
+}
+
+// Bring-up is event-driven and non-blocking; DHCP renewal/link flaps are the PHY's
+// problem, so the periodic ensure is a no-op (kept for loop() symmetry with WiFi).
+static void net_setup()  { WiFi.onEvent(on_eth_event);   // ETH events ride the WiFi event bus
+                           ETH.begin(GW_ETH_ADDR, GW_ETH_POWER_PIN, GW_ETH_MDC_PIN,
+                                     GW_ETH_MDIO_PIN, GW_ETH_TYPE, GW_ETH_CLK_MODE); }
+static void net_ensure() {}
+#else
 // --- WiFi + ingest ---------------------------------------------------------------------
 // Baked network list, tried in order: the site's primary network first, then any fallback
 // (the bench SSID) so the SAME firmware works on-site and on the bench. Add more pairs
@@ -1002,10 +1120,13 @@ static void wifi_ensure() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(n.ssid, n.psk);
 }
+static void net_setup()  { wifi_ensure(); }
+static void net_ensure() { wifi_ensure(); }
+#endif
 
 static bool s_ntp_started = false;
 static void ntp_ensure() {
-    if (s_ntp_started || WiFi.status() != WL_CONNECTED) return;
+    if (s_ntp_started || !net_up()) return;
     configTime(0, 0, "pool.ntp.org");   // UTC
     s_ntp_started = true;
 }
@@ -1168,7 +1289,7 @@ static bool upload_pending() {
 // GET /api/v1/site?slug=<GW_SITE> with the device token; cache the display name in NVS.
 // Blocking TLS GET, so callers gate it on !radio_busy() like the other HTTP work.
 static void fetch_site_name() {
-    if (WiFi.status() != WL_CONNECTED) return;
+    if (!net_up()) return;
     WiFiClientSecure tls;
     tls.setInsecure();
     HTTPClient http;
@@ -1195,6 +1316,7 @@ static void fetch_site_name() {
 }
 
 // --- OLED render ------------------------------------------------------------------------
+#ifdef GW_HAS_OLED
 static void oled_init() {
     // Heltec V3 powers the OLED through Vext — must be pulled LOW or the panel stays dark.
     pinMode(Vext, OUTPUT);
@@ -1276,8 +1398,9 @@ static void oled_render() {
     }
     u8g2.sendBuffer();
 }
+#endif  // GW_HAS_OLED
 
-// --- WiFi firmware updates (ArduinoOTA / espota) ----------------------------------------
+// --- network firmware updates (ArduinoOTA / espota) -------------------------------------
 // Enabled once, the first time WiFi comes up. Reachable at <ip>:3232, password-gated.
 // Push from a machine that can route to the box (over the WG site-to-site tunnel):
 //   pio run -e heltec-v3-gateway-ota -t upload --upload-port <gateway-ip>
@@ -1286,22 +1409,28 @@ static void ota_setup() {
     ArduinoOTA.setPassword(GW_OTA_PASS);
     ArduinoOTA.onStart([]() {
         Serial.println("[gw] OTA start — pausing mesh");
+#ifdef GW_HAS_OLED
         u8g2.clearBuffer();
         u8g2.setFont(u8g2_font_7x14B_tr);
         u8g2.drawStr(10, 38, "Updating...");
         u8g2.sendBuffer();
+#endif
     });
     ArduinoOTA.onProgress([](unsigned int p, unsigned int t) {
         static int last = -1;
         int pct = t ? (int)((uint64_t)p * 100 / t) : 0;
         if (pct == last || pct % 10) return;   // redraw every 10% only
         last = pct;
+#ifdef GW_HAS_OLED
         char b[16];
         snprintf(b, sizeof(b), "OTA  %d%%", pct);
         u8g2.clearBuffer();
         u8g2.setFont(u8g2_font_7x14B_tr);
         u8g2.drawStr(24, 38, b);
         u8g2.sendBuffer();
+#else
+        Serial.printf("[gw] OTA %d%%\n", pct);
+#endif
     });
     ArduinoOTA.onEnd([]()  { Serial.println("[gw] OTA complete — rebooting"); });
     ArduinoOTA.onError([](ota_error_t e) { Serial.printf("[gw] OTA error %u\n", (unsigned)e); });
@@ -1347,9 +1476,9 @@ static void emit_self_beat() {
                "\"uploads\":%lu,\"res_ok\":%lu,\"res_fail\":%lu,"
                "\"announces\":%lu,\"chunks\":%lu}}",
                GW_SITE, GW_SITE, (unsigned long)(millis() / 1000),
-               (int)WiFi.RSSI(), reset_reason_str(),
-               (unsigned)ESP.getFreeHeap(), WiFi.SSID().c_str(),
-               WiFi.localIP().toString().c_str(),
+               net_rssi(), reset_reason_str(),
+               (unsigned)ESP.getFreeHeap(), net_desc().c_str(),
+               net_ip().toString().c_str(),
                temperatureRead(), rf_name(s_rf.current), meshc, lora,
                (unsigned long)s_stats.uploads_ok, (unsigned long)s_stats.resources_ok,
                (unsigned long)s_stats.resources_fail, (unsigned long)s_stats.announces,
@@ -1363,7 +1492,9 @@ void setup() {
     while (!Serial && millis() - t0 < 3000) delay(100);
     Serial.printf("[gw] firmware %s booting\n", GW_FW_VERSION);
     load_cached_site_name();          // so the screen shows the address at once
+#ifdef GW_HAS_OLED
     oled_init();                      // light the parent-facing screen ASAP
+#endif
     RNS::loglevel(RNS::LOG_NOTICE);   // bump to LOG_DEBUG when chasing radio issues
     Serial.printf("[gw] boot. free heap=%u\n", (unsigned)ESP.getFreeHeap());
 
@@ -1426,7 +1557,23 @@ void setup() {
     }
     lora_interface.mode(RNS::Type::Interface::MODE_GATEWAY);
     RNS::Transport::register_interface(lora_interface);
-    lora_interface.start();
+    // Radio-optional boot: on the T-Internet-POE the SX1262 is hand-wired and may not
+    // be attached yet — the gateway must still come up on the wire (ethernet + OTA +
+    // identity), so a failed radio init is loud but not fatal. The interface stays
+    // offline (send/loop no-op) until a reboot with the radio present.
+    s_radio_ok = lora_interface.start();
+    if (!s_radio_ok)
+        Serial.println("[gw] *** LoRa radio NOT initialized (absent or miswired) — "
+                       "running network-only; wire the SX1262 and reboot ***");
+
+#ifdef GW_NET_ETH
+    // RNS-over-UDP on the wired LAN: lets Python RNS peers (rnsd, the bench host)
+    // reach the mesh through this box — the tower-bridge role. Registered now,
+    // started on first link-up in loop() (the lwIP socket wants an interface).
+    udp_interface = new UDPInterface();
+    udp_interface.mode(RNS::Type::Interface::MODE_GATEWAY);
+    RNS::Transport::register_interface(udp_interface);
+#endif
 
     reticulum = RNS::Reticulum();
     reticulum.transport_enabled(true);
@@ -1447,10 +1594,10 @@ void setup() {
     RNS::Transport::register_announce_handler(h);
 
     s_web.on("/", web_root);
-    // s_web.begin() happens on first WiFi-up in loop(): binding before the STA
+    // s_web.begin() happens on first network-up in loop(): binding before the
     // interface exists leaves the listener dead (connection refused).
 
-    wifi_ensure();
+    net_setup();
 }
 
 void loop() {
@@ -1458,9 +1605,10 @@ void loop() {
     s_web.handleClient();
     ArduinoOTA.handle();
 
-    wifi_ensure();
+    net_ensure();
     ntp_ensure();
 
+#ifdef GW_HAS_OLED
     // Refresh the parent-facing screen ~2x/s when idle (slow down during a transfer so
     // the ~25 ms I2C blast never steals from the tight radio loop).
     static uint32_t last_oled = 0;
@@ -1469,6 +1617,7 @@ void loop() {
         roll_day_if_needed();
         oled_render();
     }
+#endif
 
     // One-shot confirmation that NTP actually answered (uploads defer on an unsynced
     // clock, so a silent NTP failure used to only show up as mysterious spooling).
@@ -1479,19 +1628,24 @@ void loop() {
         log_event("NTP time acquired");
     }
 
-    static bool wifi_was_up = false;
-    if ((WiFi.status() == WL_CONNECTED) != wifi_was_up) {
-        wifi_was_up = WiFi.status() == WL_CONNECTED;
-        if (wifi_was_up) {
-            Serial.printf("[gw] WiFi up, ip=%s rssi=%d\n",
-                          WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+    static bool net_was_up = false;
+    if (net_up() != net_was_up) {
+        net_was_up = net_up();
+        if (net_was_up) {
+            Serial.printf("[gw] network up (%s), ip=%s rssi=%d\n",
+                          net_desc().c_str(), net_ip().toString().c_str(), net_rssi());
             static bool web_started = false;
             if (!web_started) { s_web.begin(); web_started = true; }
             static bool ota_started = false;
             if (!ota_started) { ota_setup(); ota_started = true; }
+#ifdef GW_NET_ETH
+            static bool udp_started = false;
+            if (!udp_started) { udp_interface.start(); udp_started = true;
+                                Serial.println("[gw] RNS UDP interface up on the wire (:4242)"); }
+#endif
         }
         else {
-            Serial.println("[gw] WiFi DOWN");
+            Serial.println("[gw] network DOWN");
         }
     }
 
@@ -1509,7 +1663,7 @@ void loop() {
     // Deferred while the radio is busy — this is a blocking TLS GET.
     static uint32_t last_poll = 0;
     if (!radio_busy() &&
-        WiFi.status() == WL_CONNECTED && millis() - last_poll > GW_CMD_POLL_SECS * 1000u) {
+        net_up() && millis() - last_poll > GW_CMD_POLL_SECS * 1000u) {
         last_poll = millis();
         poll_commands();
     }
@@ -1517,7 +1671,7 @@ void loop() {
     // Refresh the site display name (address) every ~5 min so a rename in the
     // settings UI reaches the OLED. Blocking TLS GET -> same radio-quiet gate.
     static uint32_t last_sitefetch = 0;
-    if (!radio_busy() && WiFi.status() == WL_CONNECTED &&
+    if (!radio_busy() && net_up() &&
         (!last_sitefetch || millis() - last_sitefetch > 300000u)) {
         last_sitefetch = millis();
         fetch_site_name();
@@ -1529,6 +1683,17 @@ void loop() {
         s_leaf_announced = false;
         rf_on_leaf_announce();                       // confirm/adopt profile state first
         const int cmds_sent = deliver_pending_commands();
+        // One-shot surveyor probe_ack: the walker's post-announce RX window is the same
+        // delivery slot commands use. Tiny packet — doesn't gate the grant below.
+        if (s_probe_ack[0] && s_leaf_identity) {
+            RNS::Destination sv_dest(s_leaf_identity, RNS::Type::Destination::OUT,
+                                     RNS::Type::Destination::SINGLE, "trailcam", "leaf");
+            RNS::Packet pkt(sv_dest, RNS::Bytes((const uint8_t*)s_probe_ack,
+                                                strlen(s_probe_ack)));
+            pkt.send();
+            Serial.printf("[gw] probe_ack delivered: %s\n", s_probe_ack);
+            s_probe_ack[0] = 0;
+        }
         maybe_time_sync();
         maybe_grant_profile(cmds_sent);              // grant last: it retunes the radio
     }
@@ -1542,7 +1707,7 @@ void loop() {
 
     // Gateway self-beat: the Nodes page should show THIS box's health too.
     static uint32_t last_selfbeat = 0;
-    if (WiFi.status() == WL_CONNECTED &&
+    if (net_up() &&
         (millis() - last_selfbeat > 5 * 60 * 1000u || !last_selfbeat)) {
         last_selfbeat = millis();
         emit_self_beat();
@@ -1551,7 +1716,7 @@ void loop() {
     // (the beat queue is lossy by design; the upload slot holds until it succeeds).
     if (!radio_busy()) {
         post_beats();
-        if ((s_pending.jpeg || s_pending.spooled) && WiFi.status() == WL_CONNECTED) {
+        if ((s_pending.jpeg || s_pending.spooled) && net_up()) {
             if (upload_pending()) pending_clear();
         }
     }

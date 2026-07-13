@@ -1,0 +1,11 @@
+# Trail-cam gateway — 4MB LILYGO T-Internet-POE (ESP32-WROOM), OTA-capable (two app
+# slots) for espota updates over ethernet. nvs kept at the stock 0x9000/0x5000 offset
+# so the persistent RNS identity (Preferences "gateway" namespace) survives partition
+# changes. spiffs (576KB) holds the LittleFS full-res spool + RNS stores — plenty for
+# the ~100-200KB quality=max fulls plus the 64KB slack guard.
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x1B0000,
+app1,     app,  ota_1,   0x1C0000, 0x1B0000,
+spiffs,   data, spiffs,  0x370000, 0x90000,

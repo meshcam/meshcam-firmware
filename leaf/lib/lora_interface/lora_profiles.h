@@ -4,8 +4,9 @@
  *
  * Both ends of a link must run the IDENTICAL SF/BW/CR or they are mutually deaf, so
  * profiles are negotiated by INDEX into this table, never as free parameters. The file
- * is vendored verbatim in gateway-heltec/lib/lora_interface AND
- * leaf-sleep-wake/lib/lora_interface — keep the two copies byte-identical, and NEVER
+ * is vendored verbatim in EVERY firmware tree's lib/lora_interface (gateway, leaf,
+ * surveyor, bridges — homelab prototype AND meshcam-firmware) — keep all copies
+ * byte-identical, and NEVER
  * reorder or remove entries (an index in an in-flight radio_profile grant must mean the
  * same thing to old and new firmware; append only).
  *

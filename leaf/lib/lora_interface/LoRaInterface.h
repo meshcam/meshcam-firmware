@@ -47,8 +47,8 @@ public:
 	virtual void loop();
 
 	// ADR: retune to LORA_PROFILES[idx]. Before start() it just stages the params
-	// (begin() then uses them); after start() it retunes the live radio (SX126x only —
-	// SX127x boards return false). BOTH ends of a link must switch or they're deaf;
+	// (begin() then uses them); after start() it retunes the live radio (SX126x and
+	// SX127x). BOTH ends of a link must switch or they're deaf;
 	// the negotiation/fallback protocol lives in app code, not here.
 	bool set_profile(uint8_t idx);
 	uint8_t     profile() const      { return _profile; }
@@ -83,15 +83,22 @@ private:
 	int         spreading = LORA_PROFILES[LORA_PROFILE_BASE].sf;
 	int         coding    = LORA_PROFILES[LORA_PROFILE_BASE].cr;
 	uint8_t     _profile  = LORA_PROFILE_BASE;
-	const int   power     = 10;      // dBm — LOW for desk-range bench (915 antenna is on
+#ifndef LORA_TX_DBM
+#define LORA_TX_DBM 10               // dBm — LOW for desk-range bench (915 antenna is on
 	                                 // as of 2026-07-02, ~3/4-wave telescopic; two radios
 	                                 // meters apart at 17+ dBm can saturate the RX
-	                                 // front-end). Restore 17-22 for field/range tests.
+	                                 // front-end). Field/range builds override via
+	                                 // -DLORA_TX_DBM=17..22 (SX127x PA_BOOST caps at 20).
+#endif
+	const int   power     = LORA_TX_DBM;
 
 #ifdef ARDUINO
 	Module*        _module      = nullptr;
 	PhysicalLayer* _radio       = nullptr;
 	SX126x*        _sx126x      = nullptr;  // set on SX1262 boards; enables live retune
+	SX1278*        _sx127x      = nullptr;  // set on SX1276 boards (T-Beam); same purpose.
+	                                        // Typed SX1278: RadioLib declares the SF/BW/CR
+	                                        // setters there, not on the SX127x base.
 	int            _pa_mode_pin = -1;    // V4 FEM PA mode pin; -1 = not present
 #endif
 

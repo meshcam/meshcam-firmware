@@ -75,6 +75,12 @@ port for ethernet (PoE not needed while USB-powered).
 - **Isolation test (optional):** flash a *second* T-Internet-POE and run board↔board to
   separate "wired UDP transport works" from "interops with Python RNS."
 
+> **Superseded for deployment (2026-07-09):** the production wired gateway now lives in
+> [`../gateway/`](../gateway/) as the `poe-gateway*` PlatformIO envs — the full gateway
+> role (ingest POST, ADR, command downlink, time sync, telemetry, OTA) on this same
+> board, radio-optional at boot. This subproject remains as the ethernet/RNS-over-UDP
+> interop validation record.
+
 ## Step 2 — when the Core1262 arrives (Jul 8)
 
 Wire the SX1262 to free GPIO (the LAN8720 RMII uses 17/18/19/21-23/25-27 + 0; pick SPI pins

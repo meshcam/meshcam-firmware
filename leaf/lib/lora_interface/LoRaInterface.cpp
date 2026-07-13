@@ -110,7 +110,8 @@ LoRaInterface::LoRaInterface(const char* name /*= "LoRaInterface"*/) : RNS::Inte
 }
 
 // ADR retune. Pre-start: stage the params for begin(). Live: standby -> retune ->
-// back to RX. Only the SX126x boards support live retune (all current nodes); a
+// back to RX. SX126x and SX127x both support live retune (SX127x path added for the
+// T-Beam surveyor, 2026-07-10); a
 // failure leaves the radio re-armed on whatever the chip accepted, so callers treat
 // false as "profile unavailable" and stay on the negotiated fallback path.
 bool LoRaInterface::set_profile(uint8_t idx) {
@@ -123,14 +124,21 @@ bool LoRaInterface::set_profile(uint8_t idx) {
 	_bitrate  = (double)spreading * ( (4.0/coding) / (pow(2, spreading)/bandwidth) ) * 1000.0;
 #ifdef ARDUINO
 	if (_online) {
-		if (!_sx126x) {
+		int s1, s2, s3;
+		if (_sx126x) {
+			_sx126x->standby();
+			s1 = _sx126x->setSpreadingFactor(p.sf);
+			s2 = _sx126x->setBandwidth(p.bw_khz);
+			s3 = _sx126x->setCodingRate(p.cr);
+		} else if (_sx127x) {
+			_sx127x->standby();
+			s1 = _sx127x->setSpreadingFactor(p.sf);
+			s2 = _sx127x->setBandwidth(p.bw_khz);
+			s3 = _sx127x->setCodingRate(p.cr);
+		} else {
 			ERROR("LoRaInterface: live profile retune unsupported on this chip");
 			return false;
 		}
-		_sx126x->standby();
-		int s1 = _sx126x->setSpreadingFactor(p.sf);
-		int s2 = _sx126x->setBandwidth(p.bw_khz);
-		int s3 = _sx126x->setCodingRate(p.cr);
 		_radio->startReceive();
 		if (s1 != RADIOLIB_ERR_NONE || s2 != RADIOLIB_ERR_NONE || s3 != RADIOLIB_ERR_NONE) {
 			ERRORF("LoRaInterface: retune to %s failed (%d/%d/%d)", p.name, s1, s2, s3);
@@ -160,6 +168,7 @@ bool LoRaInterface::start() {
 	_module = new Module(RADIO_CS_PIN, RADIO_DIO0_PIN, RADIO_RST_PIN, RADIO_DIO1_PIN, SPI);
 	SX1276* chip = new SX1276(_module);
 	_radio = chip;
+	_sx127x = chip;
 	// begin(freq MHz, bw kHz, sf, cr, syncWord, power dBm, preamble symbols, LNA gain 0=AGC)
 	int state = chip->begin(frequency, bandwidth, spreading, coding,
 	                        RADIOLIB_SX127X_SYNC_WORD, power, 20, 0);

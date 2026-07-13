@@ -36,8 +36,8 @@ daughter-board protocol.
 | Dir | What it is | Target |
 |---|---|---|
 | `leaf/` | The camera node: PIR wake → capture → tiny-ML gate → RNS `Resource` over LoRa → deep sleep. OTA, serial command protocol, adaptive radio profiles (ADR), store-and-forward spool. | ESP32-S3 + SX1262 |
-| `gateway/` | LoRa/RNS in, WiFi + HTTPS out — pushes to any [ingest-API](https://github.com/getmeshcam/meshcam-api) server. OLED status for at-a-glance health. No PC in the data path. | Heltec V3 |
-| `bridge-poe/` | Wired-ethernet gateway variant (RNS-over-UDP to an IP network). | LILYGO T-Internet-POE |
+| `gateway/` | LoRa/RNS in, network + HTTPS out — pushes to any [ingest-API](https://github.com/meshcam/meshcam-api) server. No PC in the data path. Two board variants: Heltec V3 (WiFi uplink, OLED status) and T-Internet-POE (wired ethernet + PoE, hand-wired SX1262, RNS-over-UDP on the LAN). | Heltec V3 / LILYGO T-Internet-POE |
+| `bridge-poe/` | Ethernet bring-up validation for the T-Internet-POE (RNS-over-UDP interop with Python RNS; superseded by `gateway/`'s `poe-*` envs for deployment). | LILYGO T-Internet-POE |
 | `bridge-host/` | Dev bridge: leaf serial console → ingest API from a laptop. The "dev kit" gateway. | any host w/ Python |
 | `validation/` | The bench-validation gates that proved the architecture (kept as engineering history): `gate-a-resource` (RNS Resource on-device), `gate-b-coexist` (camera + RNS + TFLite on one MCU), `gate-a2-interop` (interop with reference Python RNS). | — |
 
@@ -48,7 +48,7 @@ daughter-board protocol.
 | Single-MCU leaf, full chain on the bench: PIR → capture → TFLite gate → LoRa RNS `Resource` → gateway → WiFi → gallery | ✅ validated (incl. QXGA full-res over the mesh, adaptive radio profiles) |
 | Camera + Reticulum + tiny-ML coexisting on one ESP32-S3 | ✅ validated (gate B) |
 | Interop with reference Python RNS | ✅ validated (gate A2) |
-| Custom leaf PCB ([meshcam-hardware](https://github.com/getmeshcam/meshcam-hardware)) | 🔄 pilot boards in bring-up |
+| Custom leaf PCB | 🔄 pilot boards in bring-up |
 | Multi-hop range in heavy woods | ⏳ field range walk scheduled — numbers will be published |
 | Relay node firmware | ⏳ next after range walk |
 
