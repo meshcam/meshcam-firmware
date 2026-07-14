@@ -1,6 +1,6 @@
 # Contributing
 
-MeshCam is developed on a private tree and released here in batches — this
+MeshCam is developed on a private tree and released here in batches; this
 GitHub repo is the canonical public mirror, and releases land as squashed
 commits. This is deliberate: it keeps the public history readable and keeps
 review bandwidth for humans (unsolicited bulk or AI-generated PRs will be

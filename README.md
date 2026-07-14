@@ -3,11 +3,11 @@
 Open-source firmware for a **LoRa mesh trail camera network**: solar leaf
 cameras deep-sleep in the woods, wake on motion, filter captures with
 on-device tiny-ML, and relay images over a [Reticulum](https://reticulum.network)
-LoRa mesh to a gateway on the property's internet — **no cellular modem per
-camera, no per-camera subscription, no cloud required**.
+LoRa mesh to a gateway on the property's internet. No cellular modem per
+camera, no per-camera subscription, no cloud required.
 
 Part of the [MeshCam](https://getmeshcam.com) project. The self-hostable web
-app, hardware design files, and device API live in sibling repos — see
+app, hardware design files, and device API live in sibling repos; see
 [docs.getmeshcam.com](https://docs.getmeshcam.com). Live demo with real
 captures: [demo.getmeshcam.com](https://demo.getmeshcam.com).
 
@@ -15,19 +15,19 @@ captures: [demo.getmeshcam.com](https://demo.getmeshcam.com).
 
 "900 MHz" is a band, not a capability. Physics gives you an iron triangle:
 
-> **Long range + low power + high bandwidth — pick two.**
+> **Long range, low power, high bandwidth: pick two.**
 
 The only corner that survives "heavy woods, all solar, months unattended" is
 LoRa: miles through foliage at ~1–5 kbps. So MeshCam does what every serious
-system in this corner does — **tiny thumbnail now, full-resolution deferred**,
+system in this corner does: **tiny thumbnail now, full-resolution deferred**,
 with the mesh moving images opportunistically and never losing one
 (store-and-forward, per-shot telemetry).
 
 Transport is **Reticulum** (via the Apache-2.0
 [microReticulum](https://github.com/attermann/microReticulum) C++ library,
 pinned): encryption, routing, addressing, and a first-class arbitrary-size
-`Resource` transfer primitive — literally "sync a blob over a LoRa mesh" as a
-built-in. The leaf is a **single ESP32-S3** running camera + PIR + TFLite
+`Resource` transfer primitive. Syncing an arbitrary-size blob over a LoRa
+mesh comes built in. The leaf is a **single ESP32-S3** running camera + PIR + TFLite
 person/animal gating + the RNS stack together: no second MCU, no radio
 daughter-board protocol.
 
@@ -36,12 +36,12 @@ daughter-board protocol.
 | Dir | What it is | Target |
 |---|---|---|
 | `leaf/` | The camera node: PIR wake → capture → tiny-ML gate → RNS `Resource` over LoRa → deep sleep. OTA, serial command protocol, adaptive radio profiles (ADR), store-and-forward spool. | ESP32-S3 + SX1262 |
-| `gateway/` | LoRa/RNS in, network + HTTPS out — pushes to any [ingest-API](https://github.com/meshcam/meshcam-api) server. No PC in the data path. Two board variants: Heltec V3 (WiFi uplink, OLED status) and T-Internet-POE (wired ethernet + PoE, hand-wired SX1262, RNS-over-UDP on the LAN). | Heltec V3 / LILYGO T-Internet-POE |
+| `gateway/` | LoRa/RNS in, network + HTTPS out; pushes to any [ingest-API](https://github.com/meshcam/meshcam-api) server. No PC in the data path. Two board variants: Heltec V3 (WiFi uplink, OLED status) and T-Internet-POE (wired ethernet + PoE, hand-wired SX1262, RNS-over-UDP on the LAN). | Heltec V3 / LILYGO T-Internet-POE |
 | `bridge-poe/` | Ethernet bring-up validation for the T-Internet-POE (RNS-over-UDP interop with Python RNS; superseded by `gateway/`'s `poe-*` envs for deployment). | LILYGO T-Internet-POE |
 | `bridge-host/` | Dev bridge: leaf serial console → ingest API from a laptop. The "dev kit" gateway. | any host w/ Python |
 | `validation/` | The bench-validation gates that proved the architecture (kept as engineering history): `gate-a-resource` (RNS Resource on-device), `gate-b-coexist` (camera + RNS + TFLite on one MCU), `gate-a2-interop` (interop with reference Python RNS). | — |
 
-## Status — honest and current (July 2026)
+## Status (July 2026)
 
 | Milestone | Status |
 |---|---|
@@ -49,7 +49,7 @@ daughter-board protocol.
 | Camera + Reticulum + tiny-ML coexisting on one ESP32-S3 | ✅ validated (gate B) |
 | Interop with reference Python RNS | ✅ validated (gate A2) |
 | Custom leaf PCB | 🔄 pilot boards in bring-up |
-| Multi-hop range in heavy woods | ⏳ field range walk scheduled — numbers will be published |
+| Multi-hop range in heavy woods | ⏳ field range walk scheduled; numbers will be published |
 | Relay node firmware | ⏳ next after range walk |
 
 This is a working prototype being developed in the open, not a shipping
@@ -71,5 +71,5 @@ gateway destination, ingest URL), and the serial command protocol. Radios are
 
 ## License
 
-GPL-3.0 — see [LICENSE](LICENSE). Commercial licensing available; open an
+GPL-3.0, see [LICENSE](LICENSE). Commercial licensing available; open an
 issue or email hello@getmeshcam.com.

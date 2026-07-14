@@ -1,14 +1,14 @@
-# Gate A — microReticulum `Resource` transfer over LoRa (bench test)
+# Gate A: microReticulum `Resource` transfer over LoRa (bench test)
 
 **Status:** **GATE A CONCLUDED (2026-07-03): Resource-on-MCU WORKS, ceiling measured.**
 5/15/25 KB all reassembled byte-complete over real 915 MHz air (server logged
 `RESOURCE COMPLETE` + hash for each); **35 KB+ is not possible** on a no-PSRAM
-Heltec V3 — `std::bad_alloc` in the link encrypt even from a clean ~331 KB heap
+Heltec V3: `std::bad_alloc` in the link encrypt even from a clean ~331 KB heap
 (all-or-nothing in RAM; upstream multi-segment send is an empty TODO stub). Outcome =
 the anticipated middle row of the decision matrix below: **thumbnail-on-mesh holds
 with huge margin; full-res rides app-layer chunking at ≤ ~20 KB per chunk.**
 Effective goodput at SF8/125 kHz desk range, 10 dBm: **~160-180 B/s** (15 KB in 86 s,
-25 KB in 158 s). Four fatal runtime bugs found + fixed on the first-ever hardware run —
+25 KB in 158 s). Four fatal runtime bugs found + fixed on the first-ever hardware run;
 see "Hardware-run findings" below. Parent design:
 [`docs/trailcam/design.md`](../../../docs/trailcam/design.md) → "Gates & validation".
 
@@ -22,7 +22,7 @@ see "Hardware-run findings" below. Parent design:
 The whole trail-cam payload path rests on one unverified assumption: that
 **microReticulum's `Resource` primitive actually segments, retries, and reassembles
 a multi-KB blob on an MCU.** `Resource` exists in the source
-(`src/microReticulum/Resource.{h,cpp}`) and the v0.5.0 roadmap marks it landed — but
+(`src/microReticulum/Resource.{h,cpp}`) and the v0.5.0 roadmap marks it landed, but
 **no upstream example exercises it** (the examples stop at `Link` + `Packet`, ≤ Link
 MDU). So we prove it ourselves before any money goes into cameras/solar/enclosures.
 
@@ -33,7 +33,7 @@ reassembly + retry-under-loss.
 ## The rig: two Heltec V3s, no Pi needed
 
 Both boards run the **same firmware** in this project, one as server (receiver), one
-as client (sender). These are the **two Heltec V3s from the phase-1 range kit** — Gate
+as client (sender). These are the **two Heltec V3s from the phase-1 range kit**; Gate
 A costs **zero extra hardware**. A laptop is only a serial monitor.
 
 ```
@@ -45,14 +45,14 @@ A costs **zero extra hardware**. A laptop is only a serial monitor.
 
 An earlier draft framed Gate A as device ↔ a Pi running full Python RNS via an RNode.
 **That's the wrong rig for this gate.** microReticulum's `LoRaInterface` uses its
-**own split-packet L2 framing** (254-byte frames, custom 1-byte header — see
+**own split-packet L2 framing** (254-byte frames, custom 1-byte header; see
 `examples/common/lora_interface/LoRaInterface.h`), which is **not** the air format
 RNode firmware speaks. Pointing a microReticulum-LoRaInterface node at a Python-RNS
-RNode would test *L2 interoperability* and *Resource-on-MCU* at the same time — if it
+RNode would test *L2 interoperability* and *Resource-on-MCU* at the same time; if it
 failed you wouldn't know which broke.
 
 So: **Gate A = two microReticulum nodes, same L2** (isolates "does Resource work").
-The microReticulum ↔ Python-RNS/RNode interop question is **real and separate** — call
+The microReticulum ↔ Python-RNS/RNode interop question is **real and separate**: call
 it **Gate A2**, and it decides the *production gateway* design (does the leaf's L2
 reach a Pi gateway directly, or does the gateway MCU bridge LoRaInterface→serial→Pi?).
 Don't assume it; verify it on its own. Tracked as an open item in the design doc.
@@ -63,7 +63,7 @@ Don't assume it; verify it on its own. Tracked as an open item in the design doc
    VS Code ext).
 2. `pio run -e heltec-v3-server` (and `-e heltec-v3-client`). First build pulls the
    esp32 platform/toolchain + microReticulum (pinned) + RadioLib + microStore +
-   attermann/Crypto, ~3 min cold. **No manual vendoring** — `lib/lora_interface/` is
+   attermann/Crypto, ~3 min cold. **No manual vendoring**: `lib/lora_interface/` is
    committed. The radio defaults there are **915 MHz / SF8 / BW125 / CR5 / 17 dBm**
    (US ISM); both boards must match (they do, same firmware).
 
@@ -81,7 +81,7 @@ pio run -e heltec-v3-client -t upload --upload-port /dev/ttyACM1
 pio device monitor -p /dev/ttyACM1 -b 115200
 ```
 
-Antennas on **both** boards before powering — a bare LoRa PA into no load can fry.
+Antennas on **both** boards before powering: a bare LoRa PA into no load can fry.
 
 ## Pass / fail
 
@@ -106,7 +106,7 @@ is the property that lets store-and-forward tolerate a flaky woods link.
 - ❌ **`Resource` unusable on-device** → the architecture bends: 2-MCU leaf (cam board
   + separate `microReticulum_Firmware` RNode over serial), or reconsider Meshtastic's
   bolted-on image transfer for the payload path. This is the finding that most changes
-  the build — which is exactly why Gate A runs first.
+  the build, which is exactly why Gate A runs first.
 
 ## Files
 
@@ -120,26 +120,26 @@ is the property that lets store-and-forward tolerate a flaky woods link.
 ## Closed at compile time
 
 - [x] `RNS::Bytes` single-byte append → `append(uint8_t)` (Bytes.h:367). Compiles.
-- [x] `no_ota.csv` partition fits — the app is ~40% of 2 MB. Fine.
+- [x] `no_ota.csv` partition fits: the app is ~40% of 2 MB. Fine.
 - [x] All RNS API calls (Identity / Destination / Link / Resource / Transport / the
       `ACCEPT_ALL` strategy + started/concluded callbacks) compile against
       microReticulum `c02b6e3`.
 
-## Open — runtime only (needs the two boards)
+## Open: runtime only (needs the two boards)
 
 - [x] `ACCEPT_ALL` auto-delivery **CONFIRMED** on hardware: once the server-side link
-      actually activates (see finding 2 below — that's the hard part), the advertise is
+      actually activates (see finding 2 below; that's the hard part), the advertise is
       accepted with no explicit `Resource::accept()` and `set_resource_started_callback`
       fires. No code change needed.
-- [x] `advertise=true` self-drives the transfer **CONFIRMED** — sender advertise →
+- [x] `advertise=true` self-drives the transfer **CONFIRMED**: sender advertise →
       receiver part-requests → parts → proof, all from the `reticulum.loop()` pump.
-      (After fixing the deadlock that pump triggers — finding 3.)
+      (After fixing the deadlock that pump triggers: finding 3.)
 
 ## Hardware-run findings (2026-07-02, first run ever on boards)
 
 Three bugs, each independently fatal to the transfer. The debugging ladder that found
 them: `RNS_LOG_LEVEL=7` build flag (DEBUG logs are silently compiled OUT at the
-default VERBOSE cap — `RNS::loglevel(LOG_DEBUG)` alone does nothing).
+default VERBOSE cap; `RNS::loglevel(LOG_DEBUG)` alone does nothing).
 
 1. **Client TX-flooded itself deaf.** `role_loop` ran every 10 ms and called
    `Transport::request_path()` unconditionally while pathless → the half-duplex radio
@@ -149,7 +149,7 @@ default VERBOSE cap — `RNS::loglevel(LOG_DEBUG)` alone does nothing).
 2. **Half-open link: the server's announce ticker shot down the RTT packet.** The
    initiator's one-shot LRRTT packet after proof validation is the ONLY thing that
    activates the responder-side link and fires the destination's
-   `link_established` callback (`Link.cpp rtt_packet()` — and a lost one is never
+   `link_established` callback (`Link.cpp rtt_packet()`, and a lost one is never
    retried). The server's blind 5 s announce TX overlapped it (the handshake
    phase-locks the timing, so it recurred every run). Client then "established",
    advertise received by the server, silently dropped at `ACCEPT_NONE` (the callback
@@ -161,7 +161,7 @@ default VERBOSE cap — `RNS::loglevel(LOG_DEBUG)` alone does nothing).
    @ `c02b6e3`): `Transport::jobs()` sets `_jobs_running=true` and pumps
    `link.tick_resources()`; a watchdog retry (advertise re-send, part-request re-send)
    re-enters `Transport::outbound()`, whose literal port of Python's thread-lock wait
-   — `while (_jobs_running) OS::sleep(0.0005);` — spins forever on a single thread.
+   (`while (_jobs_running) OS::sleep(0.0005);`) spins forever on a single thread.
    Both boards wedged solid (no serial, no RX, no WDT reset) at the first retry, every
    run. Fixed by `patch_microreticulum.py` (idempotent `extra_scripts` pre-build patch
    of libdeps; same latent bug guarded in `Transport::inbound`). Worth upstreaming.
@@ -180,11 +180,11 @@ default VERBOSE cap — `RNS::loglevel(LOG_DEBUG)` alone does nothing).
 | 5120 B | ✅ COMPLETE | repeatedly, across many runs/reboots |
 | 15360 B | ✅ COMPLETE | 86 s (~179 B/s) |
 | 25600 B | ✅ COMPLETE | 158 s (~162 B/s) |
-| 35840 B | ❌ `std::bad_alloc` | in link encrypt, clean 331 KB heap — fragmentation + several full-size copies + contiguous-block needs |
+| 35840 B | ❌ `std::bad_alloc` | in link encrypt, clean 331 KB heap: fragmentation + several full-size copies + contiguous-block needs |
 | 51200 B | ❌ never reachable | |
 
 Design consequences: alert thumbnails (~4-8 KB) have huge margin. The leaf's
-"standard" 800×600 tier (~26 KB) sits AT the edge — send it chunked too. Full-res
+"standard" 800×600 tier (~26 KB) sits AT the edge; send it chunked too. Full-res
 QXGA (~110-140 KB) = app-layer chunking at ≤ ~20 KB per chunk (~6-8 sequential
 Resources, reassembled at the gateway; at ~170 B/s that's ~12-15 min of airtime, an
 on-demand operation, not a per-event one). The receiving gateway Heltec has the same
@@ -193,9 +193,9 @@ no-PSRAM constraint, so the ceiling binds both directions.
 Operational gotchas for reruns:
 
 - **The server identity is random per boot** (`RNS::Identity()` + `filesystem.format()`
-  at startup) — every server reflash/reset mints a new destination hash; re-capture it
+  at startup): every server reflash/reset mints a new destination hash; re-capture it
   from the boot banner and rebake `GATE_A_SERVER_DEST_HEX` before reflashing the client.
 - The esp_littlefs `Failed to unlink ... Has open FD` spam from the microStore
   known/path/hashlist stores is noisy but has not (yet) been load-bearing.
 - Effective goodput at SF8/125 kHz desk range measured ~115 B/s for the 5 KB stage
-  (44 s) — protocol turnarounds dominate at small sizes.
+  (44 s); protocol turnarounds dominate at small sizes.
