@@ -43,11 +43,11 @@ daughter-board protocol.
 
 ## Status (July 2026)
 
-The full pipeline is validated end to end: PIR wake → capture → on-device
-TFLite gate → LoRa RNS `Resource` transfer → gateway → gallery, including
-full-resolution QXGA images over the mesh, adaptive radio profiles, and
-interop with the reference Python RNS. Custom leaf PCBs are in pilot
-production and field deployments are underway for summer 2026.
+Field testing is underway. The whole chain runs today: PIR wake → capture →
+on-device TFLite gate → LoRa RNS `Resource` transfer → gateway → gallery,
+including full-resolution QXGA images over the mesh, adaptive radio
+profiles, and interop with the reference Python RNS. Custom leaf PCBs are
+in pilot production.
 
 To hear when hardware kits are available: [getmeshcam.com](https://getmeshcam.com).
 
