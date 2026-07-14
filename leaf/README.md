@@ -4,7 +4,7 @@ The battery/solar leaf's power core. The ESP32-S3 spends ~all its life in deep s
 wakes on either the **AM312 PIR (GPIO21, ext0)** (an always-instant capture event) or an
 **adaptive timer** (proactive check-in; season/time-of-day controls the interval, never a
 capture). Deep sleep resets the MCU, so every wake is a fresh boot; state that must survive
-lives in `RTC_DATA_ATTR`. Parent: [`docs/trailcam/design.md`](../../../docs/trailcam/design.md).
+lives in `RTC_DATA_ATTR`. Design rationale: [docs.getmeshcam.com](https://docs.getmeshcam.com).
 
 ## Build / run
 ```
@@ -18,10 +18,9 @@ Wave at the PIR → `wake ... cause=PIR (ext0)`. Leave it idle → `cause=timer`
 
 
 
-## Custom leaf PCB envs (added 2026-07-08, boards in transit)
+## Custom leaf PCB envs
 
-`leaf-pcb` / `leaf-pcb-field` carry every PCB delta and COMPILE-VERIFIED
-(hardware validation = pilot bring-up, see docs/trailcam/leaf-pcb-bringup.md):
+`leaf-pcb` / `leaf-pcb-field` carry every PCB delta, compile-verified:
 native-USB CDC console (no UART bridge on the board), RADIO_MISO=38,
 switched rails (leaf_rails.h: IO39 camera, IO44 radio+SD; LOW=on, board
 pull-ups hold OFF through deep sleep), microSD in SPI mode CS=43 on the
@@ -113,7 +112,7 @@ and the gate flips the send accordingly. Arena is 80 KB in internal SRAM.
 **Serial ingest transport filled in + E2E-verified (2026-07-02):** `leaf_serial_proto.{h,cpp}`
 emits the host-bridge framing on the normal USB console (spec:
 [`../host-bridge/README.md`](../host-bridge/README.md), contract:
-[`docs/trailcam/ingest-api.md`](../../../docs/trailcam/ingest-api.md)): `!TC TLM` heartbeat on
+the [ingest API spec](https://github.com/meshcam/meshcam-api)): `!TC TLM` heartbeat on
 **every** wake (beacon-at-least-daily by construction) and `!TC EVT` + base64 + `!TC END`
 (crc32) per sent capture. Protocol lines coexist with normal log output; no console changes.
 Verified end-to-end against **trailcam-dev** via the bridge (run on the dev host with the

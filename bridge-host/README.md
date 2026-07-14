@@ -3,7 +3,7 @@
 Until the mesh has a relay + gateway, the workstation plays the gateway:
 this script reads framed captures off the prototype leaf's **USB serial**
 console and uploads them to **trailcam.example.com** with the standard
-spool-until-2xx rule (see [`docs/trailcam/ingest-api.md`](../../../docs/trailcam/ingest-api.md)).
+spool-until-2xx rule (see the [ingest API spec](https://github.com/meshcam/meshcam-api)).
 It doubles as the reference implementation for the real gateway daemon.
 
 ```sh

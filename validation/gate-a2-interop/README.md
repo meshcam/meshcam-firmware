@@ -1,8 +1,8 @@
 # Gate A2: microReticulum ↔ Python RNS interop + the gateway bridge
 
-**Status:** skeleton, not yet built/flashed (2026-06-30). No hardware in hand.
-Parent: [`docs/trailcam/design.md`](../../../docs/trailcam/design.md) → "Gates &
-validation". Depends on [Gate A](../gate-a-resource/) (Resource-on-device).
+**Status: PASSED.** microReticulum (C++) ↔ reference Python RNS interop
+validated end to end; kept as engineering history. Depends on
+[Gate A](../gate-a-resource/) (Resource-on-device).
 
 ## The decision this gate makes
 

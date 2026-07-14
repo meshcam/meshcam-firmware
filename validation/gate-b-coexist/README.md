@@ -42,7 +42,7 @@ via its CH343 UART bridge, `1a86:55d3`): merged the pio build images into one bi
 (`esptool merge_bin`), scp'd it over, flashed at 0x0 with a minimal `esptool` venv on the
 laptop. Reproducible from `.pio/build/freenove-s3-noradio/` (bootloader/partitions/
 firmware + framework `boot_app0.bin` at 0x0/0x8000/0xe000/0x10000).
-Parent: [`docs/trailcam/design.md`](../../../docs/trailcam/design.md) → "Gates &
+Parent: the MeshCam design docs ([docs.getmeshcam.com](https://docs.getmeshcam.com)) → "Gates &
 validation". Runs after / alongside [Gate A](../gate-a-resource/).
 
 > Camera (`esp_camera`) + RNS (microReticulum `c02b6e3`) + the TFLite arena stub +
@@ -83,7 +83,7 @@ Avoids 0/3/45/46 (strapping), 19/20 (USB-JTAG), 26-37 (flash + octal PSRAM). **M
 not 21:** GPIO21 is reserved for the deployed leaf's PIR ext0 deep-sleep wake (RTC domain
 is 0-21); SPI routes to any pin via the S3 matrix so MISO on 38 is free. GPIO3 (battery
 ADC) + 40/41 (BME280 I2C) are also reserved for the leaf; none are wired for this bench
-test. See the leaf GPIO budget in `docs/trailcam/hardware.md`.
+test. See the leaf GPIO budget in the hardware design notes.
 
 ### `xiao-s3-sense`: Seeed XIAO ESP32S3 Sense (compact)
 The Sense camera pins are **all internal to the B2B** {10-18,38,39,40,47,48}, so the

@@ -1,8 +1,5 @@
 # Surveyor: handheld RNS probe (LILYGO T-Beam V1.2, SX1276)
 
-Spec + rationale: `docs/trailcam/surveyor.md` in the (private) homelab repo.
-The operational walk records live there; this repo is the firmware's home
-(extracted from `homelab/prototype/trail-cam/surveyor` 2026-07-10).
 Walk into a meshcam mesh, power on, press the button: a dummy probe rides the real
 stack (microReticulum `Resource` → gateway) and both ends log a GPS-stamped
 proof-of-connection. Needs a gateway running **gateway-0.7.8+probe** or later for

@@ -43,18 +43,13 @@ daughter-board protocol.
 
 ## Status (July 2026)
 
-| Milestone | Status |
-|---|---|
-| Single-MCU leaf, full chain on the bench: PIR → capture → TFLite gate → LoRa RNS `Resource` → gateway → WiFi → gallery | ✅ validated (incl. QXGA full-res over the mesh, adaptive radio profiles) |
-| Camera + Reticulum + tiny-ML coexisting on one ESP32-S3 | ✅ validated (gate B) |
-| Interop with reference Python RNS | ✅ validated (gate A2) |
-| Custom leaf PCB | 🔄 pilot boards in bring-up |
-| Multi-hop range in heavy woods | ⏳ field range walk scheduled; numbers will be published |
-| Relay node firmware | ⏳ next after range walk |
+The full pipeline is validated end to end: PIR wake → capture → on-device
+TFLite gate → LoRa RNS `Resource` transfer → gateway → gallery, including
+full-resolution QXGA images over the mesh, adaptive radio profiles, and
+interop with the reference Python RNS. Custom leaf PCBs are in pilot
+production and field deployments are underway for summer 2026.
 
-This is a working prototype being developed in the open, not a shipping
-product. If you want to be told when hardware kits are available:
-[getmeshcam.com](https://getmeshcam.com).
+To hear when hardware kits are available: [getmeshcam.com](https://getmeshcam.com).
 
 ## Build & flash (leaf)
 

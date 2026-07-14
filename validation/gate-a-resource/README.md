@@ -10,7 +10,7 @@ with huge margin; full-res rides app-layer chunking at ≤ ~20 KB per chunk.**
 Effective goodput at SF8/125 kHz desk range, 10 dBm: **~160-180 B/s** (15 KB in 86 s,
 25 KB in 158 s). Four fatal runtime bugs found + fixed on the first-ever hardware run;
 see "Hardware-run findings" below. Parent design:
-[`docs/trailcam/design.md`](../../../docs/trailcam/design.md) → "Gates & validation".
+the MeshCam design docs ([docs.getmeshcam.com](https://docs.getmeshcam.com)).
 
 > Verified builds (microReticulum pinned @ `c02b6e3`): `heltec-v3-server` and
 > `heltec-v3-client` both link, ~40% of a 2 MB app partition, 7.5% RAM. The

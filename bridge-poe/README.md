@@ -5,7 +5,7 @@ LAN8720 ethernet and **interoperates with reference Python RNS**: a real `Link` 
 and 5 KB + 10 KB `Resource`s completed with verified SHA256, board↔Python-RNS over
 ethernet. **OTA over ethernet also validated** (pushed firmware to a PoE-only board, no
 USB). Runs on an ESP32-WROOM (espressif32@6.9.0). Parent:
-[`docs/trailcam/hardware.md`](../../../docs/trailcam/hardware.md) → "Gateway / tower node".
+the gateway/tower hardware notes.
 
 > **WROOM RAM ceiling (found in test):** *originating* a ≥20 KB blob (5/50/250 KB was the
 > Gate A ladder) resets this ESP32-WROOM: RAM + RNS segmentation buffers exceed the ~270 KB
