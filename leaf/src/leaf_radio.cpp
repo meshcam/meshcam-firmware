@@ -10,6 +10,8 @@
 #include <LoRaInterface.h>          // vendored in lib/lora_interface (proven in gate-b)
 #include <microReticulum.h>
 
+#include "leaf_serial_proto.h"      // tc_node_slug / tc_set_node_slug (wire identity)
+
 // --- persistent RNS objects (rebuilt each boot; identity is the stable part) ----------
 static RNS::Reticulum reticulum({RNS::Type::NONE});
 static RNS::Interface lora_interface({RNS::Type::NONE});
@@ -101,6 +103,16 @@ bool leaf_radio_begin() {
     Serial.printf("[radio] leaf destination %s.%s  hash=%s\n",
                   APP_NAME, ASPECT, destination.hash().toHex().c_str());
 
+    // Derive the wire identity from the destination hash (node-identity.md): stable for
+    // the life of the NVS identity, zero-config, never a human name. No-op if a
+    // LEAF_NODE_SLUG build flag pinned a fixed slug.
+    {
+        char derived[24];
+        snprintf(derived, sizeof(derived), "leaf-%.8s", destination.hash().toHex().c_str());
+        tc_set_node_slug(derived);
+        Serial.printf("[radio] wire identity: %s\n", tc_node_slug());
+    }
+
     // 3. SX1262 bring-up (same config proven in gate-b). start() returns false if the
     //    radio doesn't answer (e.g. antenna/BUSY issue); we keep RNS up regardless so the
     //    identity/destination are still valid, but no packets go out.
@@ -124,12 +136,54 @@ bool leaf_radio_begin() {
     return s_radio;
 }
 
+// Health counters staged by leaf_radio_set_health() each wake; ride every announce's
+// app_data (bug 5) so push failures / battery are visible remotely, not just on serial.
+static uint32_t s_h_pir = 0, s_h_cap = 0, s_h_pf = 0;
+static float    s_h_vbat = NAN;
+static bool     s_h_set  = false;
+
+// Command-receipt acks (bug 8): server command ids received this wake, announced as
+// "a=<id>,<id>" so the gateway can flip them delivered -> received server-side.
+// One-shot: cleared after they ride an announce.
+#define LEAF_ACK_SLOTS 4
+static uint32_t s_ack_ids[LEAF_ACK_SLOTS];
+static int      s_ack_n = 0;
+
+void leaf_radio_set_health(uint32_t pir_wakes, uint32_t captures, uint32_t push_fails,
+                           float vbat_v) {
+    s_h_pir = pir_wakes; s_h_cap = captures; s_h_pf = push_fails;
+    s_h_vbat = vbat_v;
+    s_h_set  = true;
+}
+
 void leaf_radio_announce(const char* status) {
     if (!s_up || !s_radio) return;
-    RNS::Bytes app_data(status ? status : "");
+    char ad[128];
+    int n = snprintf(ad, sizeof(ad), "%s", status ? status : "");
+    // Node slug (leaf-0.13.0, multi-leaf roster): the gateway routes commands and
+    // attributes telemetry per camera, and the announce is the only channel that
+    // reliably ties our identity to a slug. Right after status so truncation can
+    // never eat it.
+    if (n >= 0 && n < (int)sizeof(ad))
+        n += snprintf(ad + n, sizeof(ad) - n, " n=%s", tc_node_slug());
+    if (s_h_set && n >= 0 && n < (int)sizeof(ad)) {
+        n += snprintf(ad + n, sizeof(ad) - n, " p=%lu c=%lu f=%lu",
+                      (unsigned long)s_h_pir, (unsigned long)s_h_cap,
+                      (unsigned long)s_h_pf);
+        if (!isnan(s_h_vbat) && n > 0 && n < (int)sizeof(ad))
+            n += snprintf(ad + n, sizeof(ad) - n, " vb=%.2f", s_h_vbat);
+    }
+    if (s_ack_n && n > 0 && n < (int)sizeof(ad)) {
+        n += snprintf(ad + n, sizeof(ad) - n, " a=");
+        for (int i = 0; i < s_ack_n && n > 0 && n < (int)sizeof(ad); i++)
+            n += snprintf(ad + n, sizeof(ad) - n, "%s%lu", i ? "," : "",
+                          (unsigned long)s_ack_ids[i]);
+        s_ack_n = 0;   // one announce carries them; the server ack is idempotent anyway
+    }
+    RNS::Bytes app_data(ad);
     destination.announce(app_data);
     reticulum.loop();
-    Serial.printf("[radio] announced (status=\"%s\")\n", status ? status : "");
+    Serial.printf("[radio] announced (status=\"%s\")\n", ad);
 }
 
 // --- gateway thumbnail push (Gate A-proven Link + Resource flow) -----------------------
@@ -167,10 +221,6 @@ static bool pump_until(volatile bool* flag, uint32_t ms) {
     }
     return flag && *flag;
 }
-
-#ifndef LEAF_NODE_SLUG
-#define LEAF_NODE_SLUG "c3-back-of-lake"   // keep in sync with leaf_serial_proto.cpp
-#endif
 
 // Establish (or reuse) the link to the baked gateway destination. Gate A findings as
 // policy: rate-limited path requests (an every-loop request keeps the half-duplex radio
@@ -273,7 +323,7 @@ bool leaf_radio_send_alert(const uint8_t* buf, size_t len,
     char hdr[160];
     int hlen = snprintf(hdr, sizeof(hdr),
                         "{\"event_id\":\"%s\",\"captured_at\":%lld,\"camera\":\"%s\",\"kind\":\"thumb\"}\n",
-                        event_id ? event_id : "", (long long)captured_at, LEAF_NODE_SLUG);
+                        event_id ? event_id : "", (long long)captured_at, tc_node_slug());
     uint32_t t0 = millis();
     const bool ok = send_one_resource(hdr, (size_t)hlen, buf, len, 120000);
     Serial.printf("[radio] thumb push %s (status=%d, %u bytes, %lu ms)\n",
@@ -312,7 +362,7 @@ bool leaf_radio_send_full(const uint8_t* buf, size_t len, const char* event_id,
             "{\"event_id\":\"%s\",\"captured_at\":%lld,\"camera\":\"%s\","
             "\"kind\":\"full\",\"quality\":\"%s\",\"chunk\":%u,\"chunks\":%u,"
             "\"offset\":%u,\"total\":%u}\n",
-            event_id, (long long)captured_at, LEAF_NODE_SLUG,
+            event_id, (long long)captured_at, tc_node_slug(),
             quality && quality[0] ? quality : "max",
             i, chunks, (unsigned)off, (unsigned)len);
         // Generous per-chunk budget: 16 KB ≈ 100-160 s at bench goodput, plus retries.
@@ -345,11 +395,33 @@ static void on_mesh_cmd_packet(const RNS::Bytes& data, const RNS::Packet& /*pack
     Serial.printf("[radio] mesh command queued (%u bytes)\n", (unsigned)data.size());
 }
 
+// Tiny numeric extractor for the ack path ("id": 57 in the server's command JSON).
+// Gateway-minted packets (time_sync, radio_profile grants) carry no id -> no ack.
+static bool mesh_cmd_id(const char* json, uint32_t* out) {
+    const char* p = strstr(json, "\"id\"");
+    if (!p) return false;
+    p += 4;
+    while (*p == ' ' || *p == ':') p++;
+    if (*p < '0' || *p > '9') return false;
+    *out = (uint32_t)strtoul(p, nullptr, 10);
+    return true;
+}
+
 void leaf_radio_poll_commands(uint32_t ms, tc_cmd_handler handler) {
     if (!leaf_radio_begin()) return;
     s_mesh_cmd_count = 0;
     destination.set_packet_callback(on_mesh_cmd_packet);
     leaf_radio_rx_window(ms);
+    // Receipt acks FIRST (bug 8): stage the server ids we just received and announce
+    // them before executing anything — receipt is not completion, and a fetch_full
+    // handler can hold the wake for minutes. The gateway hears the announce and flips
+    // the commands delivered -> received so the server stops redelivering.
+    for (int i = 0; i < s_mesh_cmd_count; i++) {
+        uint32_t id = 0;
+        if (mesh_cmd_id(s_mesh_cmds[i], &id) && s_ack_n < LEAF_ACK_SLOTS)
+            s_ack_ids[s_ack_n++] = id;
+    }
+    if (s_ack_n) leaf_radio_announce("ack");
     // Execute AFTER the window: a handler can run for many minutes (chunked full-res)
     // and must not be invoked from inside reticulum.loop()'s packet dispatch.
     for (int i = 0; i < s_mesh_cmd_count; i++) {

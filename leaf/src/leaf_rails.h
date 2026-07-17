@@ -32,11 +32,17 @@ static inline void leaf_rails_all_off() {
     leaf_cam_rail(false);
     leaf_radio_rail(false);
 }
-static inline void leaf_log_vbat() {
+static inline float leaf_read_vbat() {
 #ifdef LEAF_VBAT_ADC_GPIO
     // 470k/470k divider from BAT+ (EYE values) -> x2. millivolts read is
     // factory-calibrated on the S3; fine for a trend + low-batt throttle.
-    uint32_t mv = analogReadMilliVolts(LEAF_VBAT_ADC_GPIO) * 2;
-    Serial.printf("[leaf] vbat=%lumV\n", (unsigned long)mv);
+    return analogReadMilliVolts(LEAF_VBAT_ADC_GPIO) * 2 / 1000.0f;
+#else
+    return NAN;   // bench Freenove: no divider
+#endif
+}
+static inline void leaf_log_vbat() {
+#ifdef LEAF_VBAT_ADC_GPIO
+    Serial.printf("[leaf] vbat=%lumV\n", (unsigned long)(leaf_read_vbat() * 1000));
 #endif
 }

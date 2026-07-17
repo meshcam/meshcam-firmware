@@ -22,7 +22,16 @@
 bool leaf_radio_begin();
 
 // Announce the leaf's destination on the air (real TX). `status` is a short app-data tag.
+// leaf-0.12.0 (bug 5): app_data is "<status> p=<pir> c=<captures> f=<push_fails>[ vb=<V>]"
+// — the health counters make a leaf that captures fine but fails every push visible
+// remotely (the 07-15 outage looked like "quiet cam" for 21 h). Older gateways read the
+// whole string as the status; gateway-0.8.0+ splits on the first space.
 void leaf_radio_announce(const char* status);
+
+// Stage the health counters the next announce(s) will carry (bug 5). Call once per wake
+// before radio use; vbat_v = NAN when the board has no divider (bench Freenove).
+void leaf_radio_set_health(uint32_t pir_wakes, uint32_t captures, uint32_t push_fails,
+                           float vbat_v);
 
 // Alert path: push the alert thumbnail to the gateway as an RNS::Resource, wrapped in the
 // metadata ENVELOPE the gateway parses to upload under the leaf's real event id:

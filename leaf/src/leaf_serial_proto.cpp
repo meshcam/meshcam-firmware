@@ -4,21 +4,44 @@
 #include <time.h>
 #include "esp_attr.h"           // RTC_DATA_ATTR
 #include "esp_heap_caps.h"
+#include "esp_system.h"         // esp_random (per-boot event-id salt)
 #include "mbedtls/base64.h"
 
-// Node/camera slug and firmware version. Overridable per device via build flags.
+// Wire identity. Default (empty) = derived at radio init: "leaf-" + the first 8 hex of
+// the RNS destination hash (homelab docs/trailcam/node-identity.md — firmware transmits
+// a machine id, human names live only in the app). A non-empty LEAF_NODE_SLUG build flag
+// pins a fixed slug instead (bench debugging only).
 #ifndef LEAF_NODE_SLUG
-#define LEAF_NODE_SLUG "c3-back-of-lake"
+#define LEAF_NODE_SLUG ""
 #endif
 #ifndef LEAF_FW_VERSION
-#define LEAF_FW_VERSION "leaf-0.11.1"
+#define LEAF_FW_VERSION "leaf-0.15.1"
 #endif
 
+// RTC-persisted: PIR wakes mint event ids and emit the serial EVT BEFORE the radio comes
+// up, so they use the slug derived on the preceding cold boot (a PIR wake can never be
+// the first wake of a power cycle). Power loss wipes it; the cold-boot path re-derives
+// at radio init, before anything transmits.
+static RTC_DATA_ATTR char s_node_slug[24] = LEAF_NODE_SLUG;
+
+const char* tc_node_slug() { return s_node_slug[0] ? s_node_slug : "leaf-unidentified"; }
+
+void tc_set_node_slug(const char* slug) {
+    if (sizeof(LEAF_NODE_SLUG) > 1) return;   // build-flag override pins the slug
+    if (slug && slug[0]) snprintf(s_node_slug, sizeof(s_node_slug), "%s", slug);
+}
+
 // Capture counter + the current event's id, both in RTC slow memory so they survive deep
-// sleep (the normal between-events state). A full power loss resets them; that's fine once
-// the clock is synced (real timestamps make ids unique), and acceptable on the bench.
+// sleep (the normal between-events state). A full power loss resets them.
 static RTC_DATA_ATTR uint32_t s_event_seq = 0;
-static RTC_DATA_ATTR char     s_event_id[48] = {0};
+static RTC_DATA_ATTR char     s_event_id[64] = {0};
+// Per-power-cycle ID salt (bug 3, 2026-07-16): the clock reseeds from the build epoch
+// on every power loss, so <slug>-<unixtime>-<seq> repeated identical IDs across
+// power-cycles (c3-1783141499-3 was minted 07-04 AND again 07-16) and server-side
+// dedup silently ate the later captures. RTC memory survives deep sleep and dies with
+// power — exactly the reuse boundary — so one random token per power cycle makes IDs
+// unique even on a build-epoch clock. 0 = unseeded (mint on first use).
+static RTC_DATA_ATTR uint16_t s_boot_salt = 0;
 
 // zlib-compatible CRC-32 (matches Python zlib.crc32 / binascii.crc32 that the bridge uses).
 static uint32_t crc32_zlib(const uint8_t* p, size_t n) {
@@ -31,21 +54,15 @@ static uint32_t crc32_zlib(const uint8_t* p, size_t n) {
     return ~crc;
 }
 
-// Event-id prefix = node slug up to the first '-' (e.g. "c3-back-of-lake" -> "c3").
-static void node_prefix(char* out, size_t cap) {
-    const char* s = LEAF_NODE_SLUG;
-    size_t i = 0;
-    for (; s[i] && s[i] != '-' && i + 1 < cap; i++) out[i] = s[i];
-    out[i] = '\0';
-}
-
 const char* tc_new_event(int64_t unixtime) {
+    if (s_boot_salt == 0) s_boot_salt = (uint16_t)(esp_random() | 1);   // never 0
     s_event_seq++;
-    char pfx[16];
-    node_prefix(pfx, sizeof(pfx));
     const long long ts = (unixtime > 0) ? (long long)unixtime : 0;
-    snprintf(s_event_id, sizeof(s_event_id), "%s-%lld-%lu",
-             pfx, ts, (unsigned long)s_event_seq);
+    // Full slug as the prefix: with derived machine ids ("leaf-9e0d2930") the event id
+    // doubles as node attribution, and the old truncate-at-first-'-' rule would collapse
+    // every leaf to "leaf".
+    snprintf(s_event_id, sizeof(s_event_id), "%s-%lld-%04x-%lu",
+             tc_node_slug(), ts, (unsigned)s_boot_salt, (unsigned long)s_event_seq);
     return s_event_id;
 }
 
@@ -53,7 +70,7 @@ const char* tc_current_event_id() { return s_event_id; }
 
 void tc_emit_telemetry(const LeafTelemetry& t) {
     char j[320];
-    int o = snprintf(j, sizeof(j), "{\"node\":\"%s\",\"kind\":\"camera\"", LEAF_NODE_SLUG);
+    int o = snprintf(j, sizeof(j), "{\"node\":\"%s\",\"kind\":\"camera\"", tc_node_slug());
     if (!isnan(t.battery_v))    o += snprintf(j + o, sizeof(j) - o, ",\"battery_v\":%.2f", t.battery_v);
     if (!isnan(t.temp_c))       o += snprintf(j + o, sizeof(j) - o, ",\"temp_c\":%.1f", t.temp_c);
     if (!isnan(t.pressure_hpa)) o += snprintf(j + o, sizeof(j) - o, ",\"pressure_hpa\":%.1f", t.pressure_hpa);
@@ -84,7 +101,7 @@ void tc_emit_capture(const char* event_id, int64_t captured_unixtime,
     // --- EVT header ---
     char hdr[288];
     int o = snprintf(hdr, sizeof(hdr), "{\"camera\":\"%s\",\"event_id\":\"%s\"",
-                     LEAF_NODE_SLUG, event_id);
+                     tc_node_slug(), event_id);
     // captured_at is REQUIRED by the ingest contract (the bridge rejects frames without
     // it) — the caller guarantees a seeded clock (build-time epoch until gateway sync).
     {

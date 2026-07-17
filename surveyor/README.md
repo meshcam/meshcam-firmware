@@ -32,7 +32,7 @@ downlinked as `probe_ack`. `seq` is NVS-persistent for CSV↔telemetry correlati
 - **Mesh auto-selection: one image walks every mesh.** The gateway destination is
   discovered at runtime: candidates are the NVS-cached last winner, the
   `SURVEYOR_GATEWAY_CANDIDATES` build flag (comma-separated hashes: home bench
-  heltec, parents' tower T-Internet-POE), and any `trailcam_gatea.resource`
+  heltec, north40 tower T-Internet-POE), and any `trailcam_gatea.resource`
   announce overheard on the air (a brand-new mesh needs zero config). Path
   requests go out round-robin; only the mesh you're standing in answers for its
   hash, and the winner persists to NVS. OLED/status show the active gateway's

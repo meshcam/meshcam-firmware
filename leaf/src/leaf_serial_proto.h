@@ -31,6 +31,13 @@ struct LeafTelemetry {
     const char* boot_reason  = nullptr;
 };
 
+// Wire identity: "leaf-" + the first 8 hex of the RNS destination hash, pushed in by the
+// radio layer once per power cycle (RTC-persisted); a non-empty LEAF_NODE_SLUG build flag
+// pins a fixed slug instead and makes tc_set_node_slug a no-op. Until either happens,
+// tc_node_slug() returns "leaf-unidentified" (only reachable pre-radio on a cold boot).
+const char* tc_node_slug();
+void tc_set_node_slug(const char* slug);
+
 // Begin a new capture event: increments the RTC-memory counter and mints the id from
 // `unixtime` (the leaf's clock at PIR trigger; 0 if unsynced) + that counter. Returns the
 // id, also retrievable via tc_current_event_id() for a later full-res send of the same event.

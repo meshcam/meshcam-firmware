@@ -51,11 +51,8 @@
 #ifndef GW_SITE
 #define GW_SITE "home"
 #endif
-#ifndef GW_DEFAULT_CAMERA
-#define GW_DEFAULT_CAMERA "c3-back-of-lake"
-#endif
 #ifndef GW_FW_VERSION
-#define GW_FW_VERSION "gateway-0.7.8"
+#define GW_FW_VERSION "gateway-0.11.2"
 #endif
 #ifndef GW_VIEW_HOST
 #define GW_VIEW_HOST "trailcam.example.com"   // family gallery shown on the OLED
@@ -165,7 +162,8 @@ static uint32_t s_evt_ms[GW_EVT_SLOTS];
 static int      s_evt_head = 0;   // next write slot; ring is chronological from head
 static struct {
     uint32_t announces = 0, cmds_delivered = 0, resources_ok = 0, resources_fail = 0,
-             chunks = 0, uploads_ok = 0, probes = 0;
+             chunks = 0, uploads_ok = 0, probes = 0, announces_relayed = 0,
+             announces_foreign = 0;
 } s_stats;
 
 // --- parent-facing OLED (Heltec V3 SSD1306 on I2C 17/18, reset 21, Vext 36) ------------
@@ -231,6 +229,83 @@ static void human_up(uint32_t s, char* out, size_t n) {
     else                 snprintf(out, n, "up %lud", (unsigned long)(s / 86400));
 }
 
+// Leaf identity roster (bug 7, multi-leaf form, gateway-0.10.0) — the policy story
+// lives at the announce handler; the state sits up here because web_root() renders it.
+// Each entry is one TOFU-pinned trailcam.leaf identity this gateway manages, with the
+// per-identity state that used to be single globals: latest announced identity (for
+// addressing), camera slug (from the announce's "n=" token, leaf-0.13.0+ — commands
+// route by it), latest status/health, and per-leaf time-sync bookkeeping.
+#define GW_ROSTER_MAX 4
+struct LeafEntry {
+    uint8_t  pin[16];                    // trailcam.leaf destination hash (TOFU-pinned)
+    char     hex[33]         = "";       // pin as hex, for logs/web/beats
+    char     slug[24]        = "";       // camera slug ("n=" in announces); empty until heard
+    RNS::Identity identity   = RNS::Identity({RNS::Type::NONE});   // latest announcer
+    volatile bool announced  = false;    // set in dispatch, consumed in loop()
+    bool     announce_direct = false;    // hops==0 for the announce above
+    char     status[24]      = "";       // "hello"/"checkin"/... of the latest announce
+    char     health[96]      = "";       // health tail "p=.. c=.. f=.." (bug 5)
+    uint32_t last_direct_ms  = 0;        // 0 = not heard direct this boot
+    uint32_t last_sync_ms    = 0;        // per-leaf time_sync cadence (bug 10)
+    bool     synced_once     = false;
+    bool     sync_urgent     = false;    // profile adopt/change -> resync (bug 10)
+};
+static LeafEntry s_roster[GW_ROSTER_MAX];
+static int       s_roster_n        = 0;
+static bool      s_pin_save_pending = false;   // NVS write deferred out of packet dispatch
+
+static void entry_hex_refresh(LeafEntry& L) {
+    for (size_t i = 0; i < sizeof(L.pin); i++)
+        sprintf(L.hex + i * 2, "%02x", L.pin[i]);
+    // Machine-id default until an announce's "n=" tail refreshes it (node-identity.md in
+    // the homelab tree): attribution never falls back to a baked human name.
+    if (!L.slug[0]) snprintf(L.slug, sizeof(L.slug), "leaf-%.8s", L.hex);
+}
+
+// Attribution of last resort for PHOTO uploads whose envelope carries no camera (legacy
+// bare-JPEG / pre-0.13 chunks — an ingest must name a camera, unlike telemetry beats,
+// which post as gateway self-beats when unattributable): the single roster leaf's wire id
+// when unambiguous, else "leaf-unknown". GW_DEFAULT_CAMERA (a baked human name) is retired.
+static const char* gw_fallback_camera() {
+    return (s_roster_n == 1) ? s_roster[0].slug : "leaf-unknown";
+}
+// NVS: the roster is one blob of concatenated 16-byte pins under "gw-leaf"/"roster".
+// A gateway-0.9.0 single pin ("pin") migrates to entry 0 on first boot.
+static bool load_roster() {
+    Preferences p;
+    if (!p.begin("gw-leaf", /*readOnly=*/true)) return false;   // namespace not created yet
+    uint8_t buf[GW_ROSTER_MAX * 16];
+    size_t n = p.getBytesLength("roster");
+    if (n >= 16 && n % 16 == 0 && n <= sizeof(buf) && p.getBytes("roster", buf, n) == n) {
+        p.end();
+        s_roster_n = (int)(n / 16);
+        for (int i = 0; i < s_roster_n; i++) {
+            memcpy(s_roster[i].pin, buf + i * 16, 16);
+            entry_hex_refresh(s_roster[i]);
+        }
+        return true;
+    }
+    // legacy single pin -> migrate (rewritten as "roster" on the next deferred save)
+    if (p.getBytesLength("pin") == 16 && p.getBytes("pin", s_roster[0].pin, 16) == 16) {
+        p.end();
+        entry_hex_refresh(s_roster[0]);
+        s_roster_n = 1;
+        s_pin_save_pending = true;
+        Serial.println("[gw] legacy single leaf pin migrated to roster entry 0");
+        return true;
+    }
+    p.end();
+    return false;
+}
+static void save_roster() {
+    uint8_t buf[GW_ROSTER_MAX * 16];
+    for (int i = 0; i < s_roster_n; i++) memcpy(buf + i * 16, s_roster[i].pin, 16);
+    Preferences p;
+    p.begin("gw-leaf", false);
+    p.putBytes("roster", buf, (size_t)s_roster_n * 16);
+    p.end();
+}
+
 static void log_event(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -261,7 +336,15 @@ struct RfState {
 };
 static RfState s_rf;
 
-static void rf_note_leaf_heard() { s_rf.last_leaf_ms = millis(); }
+// DIRECT frames only (bug 1, 2026-07-16): a transport relay (the surveyor; the dam
+// spine's R1/R2 later) can deliver the leaf's announces across a radio-profile split,
+// and counting them here kept the quiet-leaf scan disarmed for 21 h while every reply
+// went out on a profile the leaf never listens on (07-15 outage root cause). App
+// callbacks run synchronously inside inbound dispatch, so last_hops belongs to the
+// frame that fired the callback.
+static void rf_note_leaf_heard() {
+    if (LoRaInterface::last_hops == 0) s_rf.last_leaf_ms = millis();
+}
 static void rf_clear_snr() { s_rf.snr_n = 0; s_rf.snr_i = 0; }
 static void rf_push_snr(float snr) {
     s_rf.snr[s_rf.snr_i] = snr;
@@ -302,7 +385,7 @@ static void web_root() {
            "color:#cdc;margin:2em}h1{font-size:16px;color:#8f8}table{border-collapse:collapse}"
            "td{padding:2px 10px;border-bottom:1px solid #333}.t{color:#888}</style>"
            "<h1>trailcam gateway — live mesh</h1><p>");
-    char line[260];
+    char line[380];
     char clock[32] = "clock NOT SYNCED";
     {
         time_t now = time(nullptr);
@@ -314,16 +397,30 @@ static void web_root() {
     }
     snprintf(line, sizeof(line),
              "uptime %lus | heap %u | fs free %uK | %s | radio %s%s | leaf rssi %.0f dBm snr %.1f<br>"
-             "announces %lu | cmds %lu | res ok/fail %lu/%lu | chunks %lu | uploads %lu",
+             "announces %lu (rf %lu, relayed %lu, foreign %lu) | cmds %lu | res ok/fail %lu/%lu | chunks %lu | uploads %lu<br>"
+             "leaf roster %d/%d%s (POST /pin/clear to re-arm TOFU)",
              (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(),
              (unsigned)((LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024), clock,
              s_radio_ok ? LORA_PROFILES[s_rf.current].name : "ABSENT — wire the SX1262",
              s_rf.pending != 0xFF ? " (confirming)" : (s_rf.scanning ? " (scanning)" : ""),
              LoRaInterface::last_rssi, LoRaInterface::last_snr,
-             (unsigned long)s_stats.announces, (unsigned long)s_stats.cmds_delivered,
+             (unsigned long)s_stats.announces, (unsigned long)LoRaInterface::announces_seen,
+             (unsigned long)s_stats.announces_relayed, (unsigned long)s_stats.announces_foreign,
+             (unsigned long)s_stats.cmds_delivered,
              (unsigned long)s_stats.resources_ok, (unsigned long)s_stats.resources_fail,
-             (unsigned long)s_stats.chunks, (unsigned long)s_stats.uploads_ok);
+             (unsigned long)s_stats.chunks, (unsigned long)s_stats.uploads_ok,
+             s_roster_n, GW_ROSTER_MAX,
+             s_roster_n ? "" : " — TOFU armed, first direct health announce pins");
     h += line;
+    for (int i = 0; i < s_roster_n; i++) {
+        const LeafEntry& L = s_roster[i];
+        char ago[24] = "never (this boot)";
+        if (L.last_direct_ms) human_ago(millis() - L.last_direct_ms, ago, sizeof(ago));
+        snprintf(line, sizeof(line), "<br>leaf %d: %.16s… %s — %s [%s], direct %s",
+                 i, L.hex, L.slug[0] ? L.slug : "(no slug yet)",
+                 L.status[0] ? L.status : "-", L.health[0] ? L.health : "-", ago);
+        h += line;
+    }
     h += F("</p><table>");
     for (int i = GW_EVT_SLOTS - 1; i >= 0; i--) {
         int idx = (s_evt_head + i) % GW_EVT_SLOTS;
@@ -515,7 +612,7 @@ static void queue_upload(const uint8_t* data, size_t len) {
         const uint32_t crc = crc32_zlib(jpeg, jlen);
         snprintf(eid, sizeof(eid), "mesh-%08x-%u", (unsigned)crc, (unsigned)jlen);
     }
-    if (!cam[0])  snprintf(cam, sizeof(cam), "%s", GW_DEFAULT_CAMERA);
+    if (!cam[0])  snprintf(cam, sizeof(cam), "%s", gw_fallback_camera());
     if (!kind[0]) snprintf(kind, sizeof(kind), "thumb");
     uint8_t* copy = (uint8_t*)malloc(jlen);
     if (!copy) { Serial.println("[gw] OOM copying payload -> dropped"); return; }
@@ -590,11 +687,11 @@ static void handle_chunk(const char* hdr, const uint8_t* body, size_t blen,
         if (isnan(LoRaInterface::last_rssi))
             queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\","
                        "\"extra\":{\"transfer\":%s}}",
-                       GW_SITE, GW_DEFAULT_CAMERA, tj);
+                       GW_SITE, cam[0] ? cam : gw_fallback_camera(), tj);
         else
             queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\","
                        "\"rssi\":%.0f,\"snr\":%.1f,\"extra\":{\"transfer\":%s}}",
-                       GW_SITE, GW_DEFAULT_CAMERA,
+                       GW_SITE, cam[0] ? cam : gw_fallback_camera(),
                        LoRaInterface::last_rssi, LoRaInterface::last_snr, tj);
     }
 
@@ -607,7 +704,8 @@ static void handle_chunk(const char* hdr, const uint8_t* body, size_t blen,
                    "\"extra\":{\"transfer\":{\"event_id\":\"%s\",\"reassembled\":%u,"
                    "\"chunks\":%u,\"ms\":%lu,\"bps\":%lu,\"quality\":\"%s\","
                    "\"profile\":\"%s\",\"raw_bps\":%u}}}",
-                   GW_SITE, GW_DEFAULT_CAMERA, eid, (unsigned)s_asm.total,
+                   GW_SITE, s_asm.camera[0] ? s_asm.camera : gw_fallback_camera(),
+                   eid, (unsigned)s_asm.total,
                    s_asm.chunks, (unsigned long)span_ms,
                    (unsigned long)(span_ms ? (uint64_t)s_asm.total * 1000 / span_ms : 0),
                    s_asm.quality[0] ? s_asm.quality : "max",
@@ -635,7 +733,7 @@ static void handle_chunk(const char* hdr, const uint8_t* body, size_t blen,
             return;
         }
         queue_upload_spooled(s_asm.total, s_asm.event_id,
-                             s_asm.camera[0] ? s_asm.camera : GW_DEFAULT_CAMERA,
+                             s_asm.camera[0] ? s_asm.camera : gw_fallback_camera(),
                              s_asm.captured_at);
         asm_reset();
     }
@@ -656,20 +754,25 @@ static void handle_probe(const char* hdr, size_t total_len, uint32_t res_ms) {
     const long long part = json_ll(hdr, "part");
     const float rssi = LoRaInterface::last_rssi;
     const float snr  = LoRaInterface::last_snr;
-    rf_note_leaf_heard();
+    // No rf_note_leaf_heard() here (gateway-0.10.0): probes come from the surveyor —
+    // FOREIGN by definition under the roster — and counting them as leaf liveness
+    // kept the quiet-leaf scan disarmed while the real leaf sat unreachable (the
+    // bug-7 pathology in miniature). Mid-transfer retune protection is radio_busy().
     Serial.printf("[gw] PROBE #%lld part %lld from %s: %u bytes in %lu ms "
                   "(rssi %.0f snr %.1f, %s)\n",
                   seq, part, slug[0] ? slug : "?", (unsigned)total_len,
                   (unsigned long)res_ms, rssi, snr, rf_name(s_rf.current));
     s_stats.probes++;
     log_event("probe #%lld from %s (%.0f dBm)", seq, slug[0] ? slug : "surveyor", rssi);
+    // kind=surveyor so the app doesn't auto-register the walker as a camera
+    // (needs app >= the schemas.py Literal that accepts it, else the beat 422s).
     if (isnan(rssi))
-        queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\","
+        queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"surveyor\","
                    "\"extra\":{\"probe\":%s,\"ms\":%lu,\"bytes\":%u,\"profile\":\"%s\"}}",
                    GW_SITE, slug[0] ? slug : "surveyor", hdr,
                    (unsigned long)res_ms, (unsigned)total_len, rf_name(s_rf.current));
     else
-        queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\","
+        queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"surveyor\","
                    "\"rssi\":%.0f,\"snr\":%.1f,"
                    "\"extra\":{\"probe\":%s,\"ms\":%lu,\"bytes\":%u,\"profile\":\"%s\"}}",
                    GW_SITE, slug[0] ? slug : "surveyor", rssi, snr, hdr,
@@ -690,9 +793,11 @@ static void on_resource_concluded(const RNS::Resource& resource) {
         Serial.printf("[gw] resource FAILED status=%d\n", (int)resource.status());
         s_stats.resources_fail++;
         log_event("resource FAILED (status %d)", (int)resource.status());
-        queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\","
+        // Gateway self-beat: a failed Resource has no envelope, so there is no leaf to
+        // honestly attribute it to — it is gateway-observed state (node-identity.md).
+        queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
                    "\"extra\":{\"transfer_error\":\"resource_failed_%d\"}}",
-                   GW_SITE, GW_DEFAULT_CAMERA, (int)resource.status());
+                   GW_SITE, GW_SITE, (int)resource.status());
         return;
     }
     const RNS::Bytes& d = resource.data();
@@ -730,9 +835,12 @@ static void on_link_established(RNS::Link& link) {
     Serial.println("[gw] leaf linked");
     rf_note_leaf_heard();
     log_event("leaf linked");
-    queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\","
+    // Gateway self-beat: the link handshake is anonymous (identity arrives with the
+    // Resource/announce that follows), so "a leaf linked" is gateway state, not any
+    // particular camera's — this is what used to mint the leaf-unknown pseudo-node.
+    queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
                "\"extra\":{\"link\":\"up\",\"via\":\"mesh\"}}",
-               GW_SITE, GW_DEFAULT_CAMERA);
+               GW_SITE, GW_SITE);
     latest_link = link;
     link.set_resource_strategy(RNS::Type::Link::ACCEPT_ALL);
     link.set_resource_started_callback(on_resource_started);
@@ -754,9 +862,109 @@ struct PendingCmd {
     bool     used      = false;
 };
 static PendingCmd s_cmds[GW_CMD_SLOTS];
-static RNS::Identity s_leaf_identity({RNS::Type::NONE});
-static volatile bool s_leaf_announced = false;
-static char s_last_announce_status[24] = "";   // "hello"/"checkin"/... of the latest announce
+
+// --- leaf identity roster (bug 7; single pin 2026-07-16, roster gateway-0.10.0) ---------
+// "s_leaf_identity = last announcer" let ANY trailcam.leaf identity win grants, command
+// delivery, time sync and liveness. On the 07-16 surveyor re-test the surveyor won the
+// ADR grant lottery and held the real leaf off the mesh for ~100 min — keepalive grants
+// self-sustain the impostor lock, and hop counting can't help because the impostor's
+// announces are direct. So pin the identities this gateway manages (the roster,
+// GW_ROSTER_MAX slots — one entry per camera at multi-cam sites):
+//   - TOFU per identity: a DIRECT announce carrying a health tail ("p=.. c=.. f=..")
+//     enrolls its trailcam.leaf destination hash into a free slot (NVS). Only real
+//     leaves (0.12.0+) send the tail; the surveyor never does, so it can't win
+//     commissioning either. Relayed announces never enroll — a relay can forward
+//     another site's leaf across a profile split (the 07-15 pathology), and a gateway
+//     that has never heard a leaf direct has no business managing it. Enrollment is
+//     open for the roster's lifetime (that's how camera N+1 self-commissions: mount
+//     it, power it, done) — the loud log/beat below is the audit trail. Caveat for a
+//     future two-sites-in-earshot layout: announces don't carry a site id, so a
+//     NEIGHBOR site's real leaf heard direct would enroll here too; today's sites are
+//     miles apart.
+//   - Commands route per entry by camera slug: leaf-0.13.0 announces carry "n=<slug>",
+//     and a command's "node" field must match the entry's slug (a sole slug-less
+//     entry keeps the legacy deliver-everything behavior).
+//   - Any non-roster trailcam.leaf identity is FOREIGN: counted, logged, beaten to
+//     telemetry under the GATEWAY node (so it can't pollute the camera's rows), still
+//     owed a probe_ack (the surveyor's actual need) and a one-shot time_sync on
+//     "hello" — but it can't touch roster identities, ADR, liveness, commands or
+//     command acks.
+//   - Site hardware swap: POST /pin/clear on the web UI empties the roster.
+static RNS::Identity s_foreign_identity({RNS::Type::NONE});   // last foreign announcer
+static volatile bool s_foreign_announced = false;
+static bool     s_foreign_hello = false;        // foreign cold boot -> one-shot time_sync
+
+static void clear_roster() {
+    Preferences p;
+    p.begin("gw-leaf", false);
+    p.remove("roster");
+    p.remove("pin");    // the pre-roster key, in case migration never re-saved
+    p.end();
+    for (int i = 0; i < s_roster_n; i++)
+        s_roster[i] = LeafEntry();      // stop addressing the old leaves
+    s_roster_n = 0;
+    Serial.println("[gw] leaf roster CLEARED — TOFU re-armed");
+    log_event("leaf roster cleared (TOFU re-armed)");
+}
+
+// Command-receipt acks (bug 8): the leaf announces "a=<id>,<id>" for server command
+// ids it received; we relay each to POST /commands/<id>/ack {"status":"received"} so
+// the server stops redelivering. Queued here (announce handler runs inside packet
+// dispatch — no blocking HTTP there), drained in loop() when the radio is quiet.
+#define GW_ACK_SLOTS 8
+static uint32_t s_cmd_acks[GW_ACK_SLOTS];
+static int      s_cmd_ack_n = 0;
+
+static void queue_cmd_acks(const char* health_tail) {
+    const char* a = strstr(health_tail, "a=");
+    if (!a) return;
+    a += 2;
+    while (*a && s_cmd_ack_n < GW_ACK_SLOTS) {
+        if (*a < '0' || *a > '9') break;
+        s_cmd_acks[s_cmd_ack_n++] = (uint32_t)strtoul(a, (char**)&a, 10);
+        if (*a == ',') a++;
+    }
+}
+
+static void post_cmd_acks() {
+    if (!s_cmd_ack_n || !net_up()) return;
+    WiFiClientSecure tls;
+    tls.setInsecure();
+    HTTPClient http;
+    http.setConnectTimeout(6000);
+    http.setTimeout(8000);
+    for (int i = 0; i < s_cmd_ack_n; i++) {
+        String url = String(GW_INGEST_URL);
+        char path[40];
+        snprintf(path, sizeof(path), "/commands/%lu/ack", (unsigned long)s_cmd_acks[i]);
+        url.replace("/ingest", path);
+        if (!http.begin(tls, url)) break;
+        http.addHeader("Authorization", "Bearer " GW_INGEST_TOKEN);
+        http.addHeader("Content-Type", "application/json");
+        static const char* body = "{\"status\":\"received\",\"detail\":\"leaf ack via announce\"}";
+        int code = http.POST((uint8_t*)body, strlen(body));
+        Serial.printf("[gw] cmd %lu ack received -> HTTP %d\n",
+                      (unsigned long)s_cmd_acks[i], code);
+        log_event("cmd %lu leaf-acked (HTTP %d)", (unsigned long)s_cmd_acks[i], code);
+        http.end();
+    }
+    s_cmd_ack_n = 0;   // fire-and-forget: redelivery re-acks if one was lost
+}
+
+// Pull the "n=<slug>" token out of an announce tail (leaf-0.13.0). Token-boundary
+// aware: matches only at the tail start or right after a space, so a slug can never
+// be faked by a substring of another token. Returns false if absent (older leaves).
+static bool htail_slug(const char* htail, char* out, size_t cap) {
+    for (const char* p = htail; p; p = strchr(p, ' '), p = p ? p + 1 : nullptr) {
+        if (strncmp(p, "n=", 2) != 0) continue;
+        p += 2;
+        size_t i = 0;
+        while (p[i] && p[i] != ' ' && i + 1 < cap) { out[i] = p[i]; i++; }
+        out[i] = '\0';
+        return i > 0;
+    }
+    return false;
+}
 
 class LeafAnnounceHandler : public RNS::AnnounceHandler {
 public:
@@ -764,17 +972,113 @@ public:
     void received_announce(const RNS::Bytes& destination_hash,
                            const RNS::Identity& announced_identity,
                            const RNS::Bytes& app_data) override {
-        (void)destination_hash;
-        s_leaf_identity  = announced_identity;
-        s_leaf_announced = true;   // loop() delivers — not from inside packet dispatch
-        std::string status((const char*)app_data.data(),
-                           std::min(app_data.size(), (size_t)24));
-        snprintf(s_last_announce_status, sizeof(s_last_announce_status), "%s", status.c_str());
-        Serial.printf("[gw] leaf announce heard (%s)\n", status.c_str());
-        s_stats.announces++;
-        rf_note_leaf_heard();
-        if (!isnan(LoRaInterface::last_snr)) rf_push_snr(LoRaInterface::last_snr);
-        log_event("announce %s (rssi %.0f)", status.c_str(), LoRaInterface::last_rssi);
+        // This handler runs synchronously inside inbound dispatch of the announce
+        // packet, so the LoRaInterface last_* statics describe THIS announce.
+        const bool direct = (LoRaInterface::last_hops == 0);
+        // app_data = "<status>[ <tail>]" — leaf-0.13.0 tails carry the node slug
+        // ("n=<slug>") plus the health counters ("p=<pir> c=<captures> f=<push_fails>
+        // [vb=<V>]", bug 5); older leaves and the surveyor send the bare status.
+        // Split on the first space, into LOCAL buffers — a foreign announce must not
+        // overwrite any roster entry's state.
+        char status[24], htail[96];
+        {
+            std::string ad((const char*)app_data.data(),
+                           std::min(app_data.size(), (size_t)120));
+            size_t sp = ad.find(' ');
+            snprintf(status, sizeof(status), "%s",
+                     ((sp == std::string::npos) ? ad : ad.substr(0, sp)).c_str());
+            snprintf(htail, sizeof(htail), "%s",
+                     (sp == std::string::npos) ? "" : ad.substr(sp + 1).c_str());
+        }
+        s_stats.announces++;               // "processed by Transport" — feeds the bug-6
+        if (!direct) s_stats.announces_relayed++;   // wedge watchdog, so count ALL
+        // --- roster membership (bug 7): is this announce from a leaf WE manage? ----
+        const bool has_health = strstr(htail, "p=") && strstr(htail, "c=");
+        int idx = -1;
+        if (destination_hash.size() == sizeof(s_roster[0].pin)) {
+            for (int i = 0; i < s_roster_n; i++)
+                if (memcmp(destination_hash.data(), s_roster[i].pin,
+                           sizeof(s_roster[i].pin)) == 0) { idx = i; break; }
+            // TOFU enrollment: direct + health tail = a real leaf physically at this
+            // site -> claim a free slot. Relayed or tail-less never enrolls (see the
+            // roster policy block above). A full roster demotes newcomers to FOREIGN.
+            if (idx < 0 && direct && has_health && s_roster_n < GW_ROSTER_MAX) {
+                idx = s_roster_n;
+                memcpy(s_roster[idx].pin, destination_hash.data(),
+                       sizeof(s_roster[idx].pin));
+                entry_hex_refresh(s_roster[idx]);
+                s_roster_n++;
+                s_pin_save_pending = true;   // NVS write happens in loop(), not dispatch
+                Serial.printf("[gw] leaf identity PINNED (TOFU, roster %d/%d): %s\n",
+                              s_roster_n, GW_ROSTER_MAX, s_roster[idx].hex);
+                log_event("leaf %d pinned %.8s", idx, s_roster[idx].hex);
+                queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
+                           "\"extra\":{\"leaf_pinned\":{\"hash\":\"%s\",\"slot\":%d}}}",
+                           GW_SITE, GW_SITE, s_roster[idx].hex, idx);
+            }
+        }
+        if (idx < 0) {
+            s_stats.announces_foreign++;
+            s_foreign_identity  = announced_identity;
+            s_foreign_hello     = direct && strcmp(status, "hello") == 0;
+            s_foreign_announced = true;   // loop() owes it a probe_ack / hello sync
+            char fh[9] = "????????";
+            if (destination_hash.size() >= 4)
+                for (int i = 0; i < 4; i++)
+                    sprintf(fh + i * 2, "%02x", destination_hash.data()[i]);
+            Serial.printf("[gw] FOREIGN trailcam.leaf announce %s (%s%s) — no leaf "
+                          "state touched (bug 7)\n", fh, status,
+                          direct ? "" : ", relayed");
+            log_event("FOREIGN announce %s (%s)", fh, status);
+            char opt[48] = "";
+            if (!isnan(LoRaInterface::last_rssi))
+                snprintf(opt, sizeof(opt), ",\"rssi\":%.0f,\"snr\":%.1f",
+                         LoRaInterface::last_rssi, LoRaInterface::last_snr);
+            queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
+                       "\"extra\":{\"foreign_announce\":{\"hash\":\"%s\","
+                       "\"status\":\"%s\",\"hops\":%u%s}}}",
+                       GW_SITE, GW_SITE, fh, status,
+                       (unsigned)LoRaInterface::last_hops, opt);
+            return;
+        }
+        LeafEntry& L = s_roster[idx];
+        L.identity        = announced_identity;
+        L.announce_direct = direct;
+        // Empty-app_data announces are real protocol frames — path responses, link
+        // handshakes, and relayed copies whose app_data doesn't survive the hop
+        // (microReticulum quirk, see the roster bench notes). The leaf IS awake, so
+        // delivery below still runs, but don't let them wipe the entry's last-known
+        // status/health.
+        if (status[0]) {
+            snprintf(L.status, sizeof(L.status), "%s", status);
+            snprintf(L.health, sizeof(L.health), "%s", htail);
+        }
+        // Camera slug (leaf-0.13.0): learn/refresh the identity->camera mapping that
+        // command routing and beat attribution key on.
+        {
+            char slug[sizeof(L.slug)];
+            if (htail_slug(htail, slug, sizeof(slug)) && strcmp(slug, L.slug) != 0) {
+                Serial.printf("[gw] leaf %d (%.8s) is camera \"%s\"%s\n", idx, L.hex,
+                              slug, L.slug[0] ? " (CHANGED)" : "");
+                log_event("leaf %d slug: %s", idx, slug);
+                snprintf(L.slug, sizeof(L.slug), "%s", slug);
+            }
+        }
+        L.announced = true;   // loop() delivers — not from inside packet dispatch
+        if (direct) L.last_direct_ms = millis();
+        Serial.printf("[gw] leaf %d announce heard (%s)%s%s%s\n", idx, status,
+                      htail[0] ? " [" : "", htail,
+                      htail[0] ? "]" : "");
+        queue_cmd_acks(htail);   // bug 8: relay leaf receipt acks
+        if (!direct)
+            Serial.printf("[gw] ^ RELAYED (hops=%u) — not counted for liveness/ADR\n",
+                          (unsigned)LoRaInterface::last_hops);
+        rf_note_leaf_heard();   // no-op for relayed frames (bug 1)
+        // ADR SNR samples must measure the DIRECT leaf<->gateway link — a relayed
+        // announce's SNR is the relay's link and poisons grant decisions (bug 1).
+        if (direct && !isnan(LoRaInterface::last_snr)) rf_push_snr(LoRaInterface::last_snr);
+        log_event("announce %s %s (rssi %.0f%s)", L.slug[0] ? L.slug : "leaf", status,
+                  LoRaInterface::last_rssi, direct ? "" : ", RELAYED");
         // Attach the raw frame we are processing RIGHT NOW (the announce handler
         // runs synchronously inside inbound handling of this very packet) so the
         // UI's packet inspector has the actual bytes, not just the summary.
@@ -783,19 +1087,45 @@ public:
         for (size_t i = 0; i < hn; i++)
             sprintf(hexbuf + i * 2, "%02x", LoRaInterface::last_frame[i]);
         hexbuf[hn * 2] = 0;
+        // Health tail (bug 5): "p=12 c=11 f=3 vb=3.87" -> structured JSON so the app
+        // can alarm on push_fails climbing without string-parsing telemetry rows.
+        char health[112] = "";
+        // Top-level battery_v mirrors health.vb — it's the field the app actually
+        // stores in the telemetry column / last_battery_v (extra.health is opaque
+        // JSON to the ingest path), so without it the UI shows "external power".
+        char batt[24] = "";
+        if (htail[0]) {
+            long p = -1, c = -1, f = -1;
+            float vb = NAN;
+            const char* t;
+            if ((t = strstr(htail, "p=")))  p  = atol(t + 2);
+            if ((t = strstr(htail, "c=")))  c  = atol(t + 2);
+            if ((t = strstr(htail, "f=")))  f  = atol(t + 2);
+            if ((t = strstr(htail, "vb=")))              vb = atof(t + 3);
+            int n = snprintf(health, sizeof(health),
+                             ",\"health\":{\"pir_wakes\":%ld,\"captures\":%ld,\"push_fails\":%ld",
+                             p, c, f);
+            if (!isnan(vb) && n > 0 && n < (int)sizeof(health))
+                n += snprintf(health + n, sizeof(health) - n, ",\"battery_v\":%.2f", vb);
+            if (!isnan(vb))
+                snprintf(batt, sizeof(batt), ",\"battery_v\":%.2f", vb);
+            if (n > 0 && n < (int)sizeof(health)) snprintf(health + n, sizeof(health) - n, "}");
+        }
         if (isnan(LoRaInterface::last_rssi))
-            queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\","
-                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\","
+            queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\"%s,"
+                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s,"
                        "\"packet\":{\"len\":%u,\"hex\":\"%s\"}}}",
-                       GW_SITE, GW_DEFAULT_CAMERA, status.c_str(),
+                       GW_SITE, L.slug[0] ? L.slug : gw_fallback_camera(), batt, status,
+                       (unsigned)LoRaInterface::last_hops, health,
                        (unsigned)LoRaInterface::last_frame_len, hexbuf);
         else
-            queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\","
+            queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\"%s,"
                        "\"rssi\":%.0f,\"snr\":%.1f,"
-                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\","
+                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s,"
                        "\"packet\":{\"len\":%u,\"hex\":\"%s\"}}}",
-                       GW_SITE, GW_DEFAULT_CAMERA,
-                       LoRaInterface::last_rssi, LoRaInterface::last_snr, status.c_str(),
+                       GW_SITE, L.slug[0] ? L.slug : gw_fallback_camera(), batt,
+                       LoRaInterface::last_rssi, LoRaInterface::last_snr, status,
+                       (unsigned)LoRaInterface::last_hops, health,
                        (unsigned)LoRaInterface::last_frame_len, hexbuf);
     }
 };
@@ -847,13 +1177,26 @@ static void poll_commands() {
     }
 }
 
-static int deliver_pending_commands() {
-    if (!s_leaf_identity) return 0;
-    RNS::Destination leaf_dest(s_leaf_identity, RNS::Type::Destination::OUT,
+static int deliver_pending_commands(LeafEntry& L) {
+    if (!L.identity) return 0;
+    RNS::Destination leaf_dest(L.identity, RNS::Type::Destination::OUT,
                                RNS::Type::Destination::SINGLE, "trailcam", "leaf");
     int sent = 0;
     for (auto& c : s_cmds) {
         if (!c.used || !c.json[0]) continue;
+        // Route by camera slug: the server stamps every command with its "node"
+        // (camera) slug, and leaf-0.13.0 announces theirs ("n="). A leaf that hasn't
+        // told us its slug only gets commands while it's the ONLY roster member (the
+        // legacy single-cam behavior); delivering blind at a multi-cam site would let
+        // the wrong leaf receipt-ack a command it can never execute (bug 8 would then
+        // stop the server redelivering it to the right one).
+        char node[48] = "";
+        json_str(c.json, "node", node, sizeof(node));
+        if (L.slug[0]) {
+            if (node[0] && strcmp(node, L.slug) != 0) continue;
+        } else if (s_roster_n > 1) {
+            continue;
+        }
         if (c.last_sent && millis() - c.last_sent < GW_CMD_SUPPRESS_SECS * 1000u) continue;
         RNS::Packet pkt(leaf_dest, RNS::Bytes((const uint8_t*)c.json, strlen(c.json)));
         pkt.send();
@@ -861,9 +1204,10 @@ static int deliver_pending_commands() {
         sent++;
     }
     if (sent) {
-        Serial.printf("[gw] delivered %d command(s) into the leaf's RX window\n", sent);
+        Serial.printf("[gw] delivered %d command(s) into %s's RX window\n", sent,
+                      L.slug[0] ? L.slug : "the leaf");
         s_stats.cmds_delivered += sent;
-        log_event("delivered %d command(s) to leaf", sent);
+        log_event("delivered %d command(s) to %s", sent, L.slug[0] ? L.slug : "leaf");
     }
     return sent;
 }
@@ -875,27 +1219,39 @@ static int deliver_pending_commands() {
 // = its clock JUST reseeded) and every few hours as a drift refresh. The leaf sets its
 // system clock from this (leaf-0.9.0+); older leaves ignore the kind (forward compat).
 #define GW_TIME_SYNC_REFRESH_S (4 * 3600)
-static uint32_t s_last_time_sync_ms = 0;
-static bool     s_time_synced_once  = false;
-static void maybe_time_sync() {
-    if (!s_leaf_identity) return;
+// Bug 10 (2026-07-16): the one-shot "hello" sync structurally misses leaf cold boots
+// under a standing grant — the leaf boots onto base while we sit on the granted
+// profile, and by the time the quiet-scan adopts down, the hello is long past (leaf
+// then runs its build-epoch clock for up to 4 h; photos backdate 12 days, bug 4).
+// So scan-adopt and every confirmed profile change arm an urgent sync ON EVERY roster
+// entry (a profile event moves the whole site's radio, so every leaf's next announce
+// may be its first heard in a while), sent on that entry's first processed announce
+// after (stays armed until our own NTP can serve it).
+static void arm_urgent_sync_all() {
+    for (int i = 0; i < s_roster_n; i++) s_roster[i].sync_urgent = true;
+}
+static void maybe_time_sync(LeafEntry& L) {
+    if (!L.identity) return;
     time_t now = time(nullptr);
     if (now < 1600000000) return;   // our own NTP isn't up -> nothing worth sharing
-    const bool cold_boot = strcmp(s_last_announce_status, "hello") == 0;
-    if (!cold_boot && s_time_synced_once &&
-        millis() - s_last_time_sync_ms < GW_TIME_SYNC_REFRESH_S * 1000u) return;
-    RNS::Destination leaf_dest(s_leaf_identity, RNS::Type::Destination::OUT,
+    const bool cold_boot = strcmp(L.status, "hello") == 0;
+    if (!cold_boot && !L.sync_urgent && L.synced_once &&
+        millis() - L.last_sync_ms < GW_TIME_SYNC_REFRESH_S * 1000u) return;
+    RNS::Destination leaf_dest(L.identity, RNS::Type::Destination::OUT,
                                RNS::Type::Destination::SINGLE, "trailcam", "leaf");
     char json[80];
     snprintf(json, sizeof(json), "{\"kind\":\"time_sync\",\"payload\":{\"unix\":%lld}}",
              (long long)time(nullptr));
     RNS::Packet pkt(leaf_dest, RNS::Bytes((const uint8_t*)json, strlen(json)));
     pkt.send();
-    s_last_time_sync_ms = millis();
-    s_time_synced_once  = true;
-    Serial.printf("[gw] time sync sent (unix %lld%s)\n",
-                  (long long)now, cold_boot ? ", leaf cold boot" : "");
+    L.last_sync_ms = millis();
+    L.synced_once  = true;
+    Serial.printf("[gw] time sync sent to %s (unix %lld%s%s)\n",
+                  L.slug[0] ? L.slug : "leaf", (long long)now,
+                  cold_boot ? ", leaf cold boot" : "",
+                  L.sync_urgent ? ", profile adopt/change" : "");
     log_event("time sync sent (unix %lld)", (long long)now);
+    L.sync_urgent = false;
 }
 
 // --- ADR state machine -------------------------------------------------------------------
@@ -926,13 +1282,15 @@ static void rf_beat(const char* event, uint8_t idx, float snr, float headroom) {
         if (!isnan(headroom) && n > 0 && n < (int)sizeof(opt))
             snprintf(opt + n, sizeof(opt) - n, ",\"headroom\":%.1f", headroom);
     }
-    queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\","
+    // Gateway self-beat: ADR decisions (scan/grant/confirm/revert) are made BY the
+    // gateway; they were only ever filed under a camera because a node string was needed.
+    queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
                "\"extra\":{\"rf\":{\"event\":\"%s\",\"profile\":\"%s\",\"idx\":%u%s}}}",
-               GW_SITE, GW_DEFAULT_CAMERA, event, rf_name(idx), (unsigned)idx, opt);
+               GW_SITE, GW_SITE, event, rf_name(idx), (unsigned)idx, opt);
 }
 
-static void rf_send_grant(uint8_t idx) {
-    RNS::Destination leaf_dest(s_leaf_identity, RNS::Type::Destination::OUT,
+static void rf_send_grant(const RNS::Identity& leaf_id, uint8_t idx) {
+    RNS::Destination leaf_dest(leaf_id, RNS::Type::Destination::OUT,
                                RNS::Type::Destination::SINGLE, "trailcam", "leaf");
     char json[96];
     snprintf(json, sizeof(json),
@@ -944,8 +1302,12 @@ static void rf_send_grant(uint8_t idx) {
     s_rf.announces_since_tx = 0;
 }
 
-// On every leaf announce, BEFORE command delivery: settle any in-flight state.
-static void rf_on_leaf_announce() {
+// On every DIRECT leaf announce, BEFORE command delivery: settle any in-flight state.
+// Relayed announces (hops>0) must not touch ADR state (bug 1): a relay can hear the
+// leaf on a profile we can't, so "an announce arrived" proves nothing about OUR link —
+// confirming/adopting on one latches the split instead of healing it.
+static void rf_on_leaf_announce(bool direct) {
+    if (!direct) return;
     if (s_rf.announces_since_tx < 255) s_rf.announces_since_tx++;
     if (s_rf.pending != 0xFF && s_rf.current == s_rf.pending) {
         // Heard the leaf on the profile we just granted -> lock it in.
@@ -955,6 +1317,7 @@ static void rf_on_leaf_announce() {
         Serial.printf("[gw] ADR: leaf CONFIRMED on %s\n", rf_name(s_rf.granted));
         log_event("ADR confirmed %s", rf_name(s_rf.granted));
         rf_beat("confirmed", s_rf.granted, LoRaInterface::last_snr, NAN);
+        arm_urgent_sync_all();   // bug 10: fresh profile -> resync the leaf clocks
     }
     if (s_rf.scanning) {
         // Scan found the leaf on whatever we're parked on — adopt that as the truth
@@ -967,14 +1330,41 @@ static void rf_on_leaf_announce() {
                       rf_name(s_rf.granted));
         log_event("ADR scan: leaf found on %s", rf_name(s_rf.granted));
         rf_beat("adopted", s_rf.granted, LoRaInterface::last_snr, NAN);
+        // Bug 10: scan-adopt IS the cold-boot-under-standing-grant path — the "hello"
+        // announce came and went on a profile we weren't parked on, so the one-shot
+        // hello sync never fired and the leaf is running its build-epoch clock.
+        arm_urgent_sync_all();
     }
 }
 
 // After command delivery on an announce: decide whether to move the leaf. cmds_sent
 // gates the grant — a leaf busy executing a fetch_full must not have the PHY yanked
 // from under the transfer it's about to start.
-static void maybe_grant_profile(int cmds_sent) {
-    if (!s_leaf_identity || s_rf.pending != 0xFF || s_rf.scanning) return;
+static void maybe_grant_profile(LeafEntry& L, int cmds_sent) {
+    if (!L.identity || s_rf.pending != 0xFF) return;
+    // Multi-leaf site (gateway-0.10.0): everyone lives on BASE. One radio can't serve
+    // two leaves on different profiles, and a fast site profile makes a newly added
+    // leaf invisible (it boots on base while we camp off-base — its hello is never
+    // heard). Any standing grant gets actively walked back: tell whichever member is
+    // announcing right now "base" and adopt base ourselves immediately; members still
+    // holding the old grant self-revert within 3 contactless wakes (leaf ADR safety).
+    if (s_roster_n > 1) {
+        if (s_rf.granted != LORA_PROFILE_BASE || s_rf.current != LORA_PROFILE_BASE) {
+            rf_send_grant(L.identity, LORA_PROFILE_BASE);
+            rf_retune(LORA_PROFILE_BASE);
+            s_rf.granted  = LORA_PROFILE_BASE;
+            s_rf.scanning = false;
+            rf_persist(LORA_PROFILE_BASE);
+            rf_clear_snr();
+            Serial.printf("[gw] ADR: %d leaves on the roster -> walking the site back "
+                          "to %s (grants suspended)\n", s_roster_n,
+                          rf_name(LORA_PROFILE_BASE));
+            log_event("ADR: multi-leaf -> base, grants suspended");
+            rf_beat("multi_leaf_base", LORA_PROFILE_BASE, NAN, NAN);
+        }
+        return;
+    }
+    if (s_rf.scanning) return;
     if (cmds_sent || asm_active()) return;   // transfer imminent or in progress
     // Keepalive refresh of a standing off-base grant. The leaf treats ANY packet from
     // us as proof we still hear it and reverts to base after 3 contactless wakes — but
@@ -984,7 +1374,7 @@ static void maybe_grant_profile(int cmds_sent) {
     // (bench 28 s or field 30 min alike); a same-idx refresh just re-arms the leaf's
     // TTL + counter without a confirm announce (leaf-0.10.1).
     if (s_rf.granted != LORA_PROFILE_BASE && s_rf.announces_since_tx >= 2) {
-        rf_send_grant(s_rf.granted);
+        rf_send_grant(L.identity, s_rf.granted);
         Serial.printf("[gw] ADR: grant keepalive (%s)\n", rf_name(s_rf.granted));
         return;
     }
@@ -1009,7 +1399,7 @@ static void maybe_grant_profile(int cmds_sent) {
                   rf_name(want), snr, headroom);
     log_event("ADR grant %s (snr %.1f)", rf_name(want), snr);
     rf_beat("grant", want, snr, headroom);
-    rf_send_grant(want);
+    rf_send_grant(L.identity, want);
     s_rf.prev           = cur;
     s_rf.pending        = want;
     s_rf.pending_ms     = millis();
@@ -1018,15 +1408,90 @@ static void maybe_grant_profile(int cmds_sent) {
     rf_clear_snr();    // SNR history doesn't transfer across profiles (BW noise floor)
 }
 
+// --- announce-starvation watchdog (bug 6, root-caused 2026-07-16) -----------------------
+// Transport's announce replay guard keys on the EMISSION TIMESTAMP embedded in each
+// announce (random_hash bytes 5..9): an announce is only processed if its timestamp
+// exceeds the max ever recorded in the path-table entry. If the leaf's clock is ever
+// corrected BACKWARD — e.g. our own time_sync landing on a leaf that booted 4 h fast
+// off a UTC-built build-epoch seed — every subsequent announce reads "older" and is
+// silently dropped: frames demodulate (announces_seen grows) but no handler ever fires,
+// so no scan-adopt, no commands, no keepalives, until wall clock crosses the poisoned
+// timebase (the 07-15 all-night wedge; reproduced deliberately on the bench 07-16).
+// The path-table entry PERSISTS in LittleFS, so reboots don't clear it. Self-heal:
+// when announces keep arriving but none process for a while, drop the leaf's path
+// entry — the next announce then arrives as "unknown destination" and is accepted
+// unconditionally, rebuilding the path with a fresh timebase.
+#define GW_ANN_WEDGE_MIN_SEEN   4
+#define GW_ANN_WEDGE_SILENT_MS  (4 * 60 * 1000u)
+#define GW_ANN_WEDGE_REBOOT_AT  3   // consecutive fires with zero processed -> reboot
+static void announce_wedge_watchdog() {
+    static uint32_t processed_baseline = 0, seen_baseline = 0, baseline_ms = 0;
+    static uint8_t  consecutive_fires = 0;
+    if (s_stats.announces != processed_baseline || baseline_ms == 0) {
+        processed_baseline = s_stats.announces;          // announces are flowing (or
+        seen_baseline      = LoRaInterface::announces_seen;   // first call) -> re-arm
+        baseline_ms        = millis();
+        consecutive_fires  = 0;
+        return;
+    }
+    if (LoRaInterface::announces_seen - seen_baseline < GW_ANN_WEDGE_MIN_SEEN) return;
+    if (millis() - baseline_ms < GW_ANN_WEDGE_SILENT_MS) return;
+    if (!s_roster_n) return;
+    // Drop every roster member's path entry. The pins ARE the trailcam.leaf
+    // destination hashes (that's what the announce handler matched on), so the NVS
+    // roster serves here even before any announce has processed this boot — the old
+    // s_leaf_identity gate meant a reboot-into-wedge couldn't self-heal at all.
+    bool had_path = false;
+    for (int i = 0; i < s_roster_n; i++) {
+        RNS::Bytes h(s_roster[i].pin, sizeof(s_roster[i].pin));
+        if (RNS::Transport::has_path(h)) {
+            RNS::Transport::remove_path(h);
+            had_path = true;
+        }
+    }
+    consecutive_fires++;
+    Serial.printf("[gw] announce WEDGE (%u/%u): %lu announces demodulated, 0 processed "
+                  "in %lus -> dropped leaf path entry%s (replay-guard reset)\n",
+                  (unsigned)consecutive_fires, (unsigned)GW_ANN_WEDGE_REBOOT_AT,
+                  (unsigned long)(LoRaInterface::announces_seen - seen_baseline),
+                  (unsigned long)((millis() - baseline_ms) / 1000),
+                  had_path ? "" : " (none existed)");
+    log_event("announce wedge %u/%u: dropped leaf path", (unsigned)consecutive_fires,
+              (unsigned)GW_ANN_WEDGE_REBOOT_AT);
+    queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
+               "\"extra\":{\"announce_wedge\":{\"seen\":%lu,\"silent_s\":%lu,\"fires\":%u}}}",
+               GW_SITE, GW_SITE,
+               (unsigned long)(LoRaInterface::announces_seen - seen_baseline),
+               (unsigned long)((millis() - baseline_ms) / 1000),
+               (unsigned)consecutive_fires);
+    // Escalation (2026-07-16 surveyor re-test): a wedge survived repeated path drops —
+    // some RAM-side Transport state (not the persisted path table) kept rejecting
+    // announces at Identity::validate_announce / the announce region, and only a
+    // reboot has ever cleared that class. An unattended field gateway must not sit
+    // announce-starved for hours (no commands, no ADR, no scan-adopt), so after
+    // GW_ANN_WEDGE_REBOOT_AT fruitless drops, restart: NVS grant + identity persist,
+    // boot-time scan-first (bug 2) re-converges within ~2 min. A transfer aborted by
+    // the reboot retries server-side; announce starvation does not.
+    if (consecutive_fires >= GW_ANN_WEDGE_REBOOT_AT) {
+        Serial.println("[gw] announce WEDGE persists through path drops -> REBOOTING "
+                       "to clear Transport RAM state");
+        log_event("announce wedge unrecoverable -> reboot");
+        post_beats();     // best-effort: get the wedge beats out before restarting
+        delay(500);
+        ESP.restart();
+    }
+    seen_baseline = LoRaInterface::announces_seen;   // re-arm; don't spin-remove
+    baseline_ms   = millis();
+}
+
 // Housekeeping outside the announce path: confirm timeouts + the quiet-leaf scan.
 static void rf_loop() {
-    // Liveness must count EVERY frame off the air, not just announces/chunk
-    // completions — a single in-flight 16 KB resource chunk runs >90 s of continuous
-    // packets with none of the app-level hooks firing, and the scan retuned the radio
-    // out from under a live transfer (observed 2026-07-03).
-    if (LoRaInterface::last_rx_ms &&
-        (int32_t)(LoRaInterface::last_rx_ms - s_rf.last_leaf_ms) > 0)
-        s_rf.last_leaf_ms = LoRaInterface::last_rx_ms;
+    // Scan liveness counts only DIRECT PINNED-LEAF announces (s_rf.last_leaf_ms via
+    // rf_note_leaf_heard). It used to count every direct frame so a >90 s in-flight
+    // resource chunk wouldn't get the radio retuned from under it (2026-07-03) — but
+    // that let ANY transmitter suppress the scan: the surveyor's frames kept it
+    // disarmed while the real leaf sat unreachable at base (bug 7, 07-16 re-test).
+    // The mid-transfer protection moved to the radio_busy()/asm_active() gates below.
     if (s_rf.pending != 0xFF && millis() - s_rf.pending_ms > GW_RF_CONFIRM_TIMEOUT_MS) {
         Serial.printf("[gw] ADR: no confirm on %s -> reverting to %s\n",
                       rf_name(s_rf.pending), rf_name(s_rf.prev));
@@ -1039,7 +1504,10 @@ static void rf_loop() {
     // Camped off-base and the leaf has gone quiet: it may have reverted to base
     // (power loss / TTL) where we can't hear it. Alternate between the granted
     // profile and base until it reappears; announce-time adoption settles it.
+    // radio_busy()/asm_active() keep the scan off a live transfer (frames every
+    // <2 s while a resource is in flight; the assembly holds across leaf wakes).
     if (s_rf.pending == 0xFF && s_rf.granted != LORA_PROFILE_BASE &&
+        !radio_busy() && !asm_active() &&
         millis() - s_rf.last_leaf_ms > GW_RF_SCAN_SILENT_MS &&
         millis() - s_rf.last_scan_ms > GW_RF_SCAN_TOGGLE_MS) {
         s_rf.last_scan_ms = millis();
@@ -1350,7 +1818,7 @@ static void draw_wifi_icon(bool wifi, int rssi) {
     }
 }
 
-// Two pages, auto-rotating every 4 s (the layout Steve picked). 6x12 font = ~21 cols.
+// Two pages, auto-rotating every 4 s. 6x12 font = ~21 cols.
 static void oled_render() {
     const bool page2 = ((millis() / 4000) % 2) == 1;
     const bool wifi  = WiFi.status() == WL_CONNECTED;
@@ -1467,6 +1935,21 @@ static void emit_self_beat() {
     char lora[56];
     if (isnan(lr)) snprintf(lora, sizeof(lora), "\"lora_rssi\":null,\"lora_snr\":null");
     else           snprintf(lora, sizeof(lora), "\"lora_rssi\":%.0f,\"lora_snr\":%.1f", lr, ls);
+    // Roster (bug 7 multi-leaf): every pinned identity + its learned camera slug, so
+    // "which cameras does this gateway manage" is visible remotely. "leaf_pin"
+    // (entry 0) stays for continuity with gateway-0.9.0 dashboards.
+    char roster[GW_ROSTER_MAX * 80 + 4] = "[";
+    {
+        int n = 1;
+        for (int i = 0; i < s_roster_n && n > 0 && n < (int)sizeof(roster) - 2; i++)
+            n += snprintf(roster + n, sizeof(roster) - n,
+                          "%s{\"hash\":\"%s\",\"slug\":%s%s%s}", i ? "," : "",
+                          s_roster[i].hex,
+                          s_roster[i].slug[0] ? "\"" : "",
+                          s_roster[i].slug[0] ? s_roster[i].slug : "null",
+                          s_roster[i].slug[0] ? "\"" : "");
+        strlcat(roster, "]", sizeof(roster));
+    }
 
     queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
                "\"uptime_s\":%lu,\"fw_version\":\"" GW_FW_VERSION "\","
@@ -1474,7 +1957,9 @@ static void emit_self_beat() {
                "\"extra\":{\"free_heap\":%u,\"wifi_ssid\":\"%s\",\"ip\":\"%s\","
                "\"soc_temp_c\":%.1f,\"lora_profile\":\"%s\",%s,%s,"
                "\"uploads\":%lu,\"res_ok\":%lu,\"res_fail\":%lu,"
-               "\"announces\":%lu,\"chunks\":%lu}}",
+               "\"announces\":%lu,\"announces_rf\":%lu,\"announces_relayed\":%lu,"
+               "\"announces_foreign\":%lu,\"leaf_pin\":%s%s%s,\"roster\":%s,"
+               "\"chunks\":%lu}}",
                GW_SITE, GW_SITE, (unsigned long)(millis() / 1000),
                net_rssi(), reset_reason_str(),
                (unsigned)ESP.getFreeHeap(), net_desc().c_str(),
@@ -1482,6 +1967,16 @@ static void emit_self_beat() {
                temperatureRead(), rf_name(s_rf.current), meshc, lora,
                (unsigned long)s_stats.uploads_ok, (unsigned long)s_stats.resources_ok,
                (unsigned long)s_stats.resources_fail, (unsigned long)s_stats.announces,
+               // announces_rf counts ANNOUNCE frames demodulated at the radio;
+               // a growing rf-vs-processed gap is Transport dropping announces
+               // (replay guard / dedup) — the bug-6 pathology, now visible remotely.
+               (unsigned long)LoRaInterface::announces_seen,
+               (unsigned long)s_stats.announces_relayed,
+               // foreign announce count + pin: a nonzero foreign count on a field
+               // gateway = an impostor/surveyor is in earshot (bug 7, visible remotely)
+               (unsigned long)s_stats.announces_foreign,
+               s_roster_n ? "\"" : "", s_roster_n ? s_roster[0].hex : "null",
+               s_roster_n ? "\"" : "", roster,
                (unsigned long)s_stats.chunks);
 }
 
@@ -1492,6 +1987,14 @@ void setup() {
     while (!Serial && millis() - t0 < 3000) delay(100);
     Serial.printf("[gw] firmware %s booting\n", GW_FW_VERSION);
     load_cached_site_name();          // so the screen shows the address at once
+    // Bug 7: restore the leaf identity roster. Empty -> TOFU arms; direct announces
+    // with a health tail (real leaves, never the surveyor) enroll themselves.
+    if (load_roster())
+        for (int i = 0; i < s_roster_n; i++)
+            Serial.printf("[gw] leaf pin %d/%d restored: %s\n", i + 1, s_roster_n,
+                          s_roster[i].hex);
+    else
+        Serial.println("[gw] empty leaf roster — TOFU armed (direct health announces enroll)");
 #ifdef GW_HAS_OLED
     oled_init();                      // light the parent-facing screen ASAP
 #endif
@@ -1552,7 +2055,15 @@ void setup() {
         s_rf.current = s_rf.granted = s_rf.prev = idx;
         if (idx != LORA_PROFILE_BASE && LoRaInterface::active) {
             LoRaInterface::active->set_profile(idx);   // staged; start() applies it
-            Serial.printf("[gw] ADR: resuming on granted profile %s\n", rf_name(idx));
+            // Bug 2 (2026-07-16): the NVS grant is a HINT, not the truth — the leaf
+            // may have reverted (TTL / power loss) while we were down, and trusting
+            // it blindly violated "every failure path converges to base". Boot camped
+            // on it but in SCANNING state: a direct announce adopts whatever profile
+            // it arrives on; 90 s of direct silence starts the granted<->base toggle.
+            // No ADR grants fire until the leaf is confirmed (scanning gates them).
+            s_rf.scanning = true;
+            Serial.printf("[gw] ADR: resuming on persisted profile %s — UNCONFIRMED, "
+                          "scan-first until a direct announce adopts it\n", rf_name(idx));
         }
     }
     lora_interface.mode(RNS::Type::Interface::MODE_GATEWAY);
@@ -1594,6 +2105,30 @@ void setup() {
     RNS::Transport::register_announce_handler(h);
 
     s_web.on("/", web_root);
+    // Site hardware swap (bug 7): empty the roster so subsequent direct health
+    // announces re-enroll. POST-only — a crawler's GET must not unpin a field gateway.
+    s_web.on("/pin/clear", HTTP_POST, []() {
+        clear_roster();
+        s_web.send(200, "text/plain", "leaf roster cleared — TOFU re-armed\n");
+    });
+    // Commissioning aid (gateway-0.10.0): park the site radio on BASE. Adding camera
+    // N+1 to a site holding a fast standing grant is otherwise a deadlock — the new
+    // leaf announces on base where we never listen (the multi-leaf walk-back only
+    // engages once it's ENROLLED, and enrollment needs it heard). POST here when
+    // mounting a new camera; the granted leaf self-reverts within 3 contactless
+    // wakes and the site re-converges (multi-leaf: stays on base; single-leaf: ADR
+    // simply re-grants once announces resume).
+    s_web.on("/rf/base", HTTP_POST, []() {
+        rf_retune(LORA_PROFILE_BASE);
+        s_rf.granted  = LORA_PROFILE_BASE;
+        s_rf.pending  = 0xFF;
+        s_rf.scanning = false;
+        rf_persist(LORA_PROFILE_BASE);
+        rf_clear_snr();
+        Serial.println("[gw] rf/base: parked on base (operator commissioning)");
+        log_event("operator parked radio on base");
+        s_web.send(200, "text/plain", "radio parked on base\n");
+    });
     // s_web.begin() happens on first network-up in loop(): binding before the
     // interface exists leaves the listener dead (connection refused).
 
@@ -1677,27 +2212,63 @@ void loop() {
         fetch_site_name();
     }
 
-    // The leaf just announced -> it's awake and listening; fire pending commands NOW,
-    // plus a time_sync when due (cold-boot hello, or the periodic drift refresh).
-    if (s_leaf_announced) {
-        s_leaf_announced = false;
-        rf_on_leaf_announce();                       // confirm/adopt profile state first
-        const int cmds_sent = deliver_pending_commands();
-        // One-shot surveyor probe_ack: the walker's post-announce RX window is the same
-        // delivery slot commands use. Tiny packet — doesn't gate the grant below.
-        if (s_probe_ack[0] && s_leaf_identity) {
-            RNS::Destination sv_dest(s_leaf_identity, RNS::Type::Destination::OUT,
-                                     RNS::Type::Destination::SINGLE, "trailcam", "leaf");
-            RNS::Packet pkt(sv_dest, RNS::Bytes((const uint8_t*)s_probe_ack,
-                                                strlen(s_probe_ack)));
-            pkt.send();
-            Serial.printf("[gw] probe_ack delivered: %s\n", s_probe_ack);
-            s_probe_ack[0] = 0;
+    // TOFU enrollment landed inside announce dispatch -> persist it here (no NVS
+    // writes from inside packet handling).
+    if (s_pin_save_pending) {
+        s_pin_save_pending = false;
+        save_roster();
+    }
+
+    // A roster leaf just announced -> it's awake and listening; fire ITS pending
+    // commands NOW, plus a time_sync when due (cold-boot hello, or the periodic
+    // drift refresh). Per entry: each leaf wakes on its own schedule.
+    for (int i = 0; i < s_roster_n; i++) {
+        LeafEntry& L = s_roster[i];
+        if (!L.announced) continue;
+        L.announced = false;
+        const bool direct = L.announce_direct;
+        rf_on_leaf_announce(direct);                 // confirm/adopt profile state first
+        // Commands + time sync still deliver on relayed announces (RNS routes them
+        // through the relay — legitimate in a relay topology); only ADR is direct-only.
+        const int cmds_sent = deliver_pending_commands(L);
+        maybe_time_sync(L);
+        // Grant last: it retunes the radio. Direct announces only (bug 1) — a grant
+        // decision keyed off a relayed announce acts on a link we can't even hear.
+        if (direct) maybe_grant_profile(L, cmds_sent);
+    }
+
+    // A FOREIGN trailcam.leaf announced (bug 7): it gets its probe_ack — probes are
+    // the surveyor's whole job, and the walker's post-announce RX window is the same
+    // delivery slot commands use — and a one-shot time_sync on "hello" (the surveyor
+    // stamps its CSV from us until GPS gets a fix). Deliberately WITHOUT touching
+    // the global sync state: the pinned leaf's refresh cadence is not the walker's.
+    if (s_foreign_announced) {
+        s_foreign_announced = false;
+        if (s_foreign_identity && (s_probe_ack[0] || s_foreign_hello)) {
+            RNS::Destination f_dest(s_foreign_identity, RNS::Type::Destination::OUT,
+                                    RNS::Type::Destination::SINGLE, "trailcam", "leaf");
+            if (s_probe_ack[0]) {
+                RNS::Packet pkt(f_dest, RNS::Bytes((const uint8_t*)s_probe_ack,
+                                                   strlen(s_probe_ack)));
+                pkt.send();
+                Serial.printf("[gw] probe_ack delivered: %s\n", s_probe_ack);
+                s_probe_ack[0] = 0;
+            }
+            time_t now = time(nullptr);
+            if (s_foreign_hello && now > 1600000000) {
+                char json[80];
+                snprintf(json, sizeof(json),
+                         "{\"kind\":\"time_sync\",\"payload\":{\"unix\":%lld}}",
+                         (long long)now);
+                RNS::Packet pkt(f_dest, RNS::Bytes((const uint8_t*)json, strlen(json)));
+                pkt.send();
+                Serial.println("[gw] one-shot time sync to foreign hello");
+            }
         }
-        maybe_time_sync();
-        maybe_grant_profile(cmds_sent);              // grant last: it retunes the radio
+        s_foreign_hello = false;
     }
     rf_loop();   // ADR confirm timeouts + quiet-leaf profile scan
+    announce_wedge_watchdog();   // bug 6: replay-guard starvation self-heal
 
     // A stalled chunked reassembly (leaf died mid-send) shouldn't hold the spool.
     if (asm_active() && millis() - s_asm.last_ms > 10 * 60 * 1000u) {
@@ -1715,6 +2286,7 @@ void loop() {
     // Beats + uploads are blocking HTTPS — defer both until the channel goes quiet
     // (the beat queue is lossy by design; the upload slot holds until it succeeds).
     if (!radio_busy()) {
+        post_cmd_acks();   // bug 8: relay leaf receipt acks (blocking TLS, radio-quiet)
         post_beats();
         if ((s_pending.jpeg || s_pending.spooled) && net_up()) {
             if (upload_pending()) pending_clear();

@@ -22,6 +22,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include "esp_sleep.h"
+#include "driver/rtc_io.h"        // rtc_gpio_deinit: hand the PIR pad back to the GPIO matrix
 #include "leaf_rails.h"
 #include "leaf_env.h"
 #include "esp_heap_caps.h"
@@ -55,6 +56,12 @@ static const gpio_num_t PIR_GPIO = (gpio_num_t)LEAF_PIR_GPIO;
 RTC_DATA_ATTR uint32_t g_boot_count   = 0;   // total wakes (incl. cold boot)
 RTC_DATA_ATTR uint32_t g_pir_wakes    = 0;   // capture events
 RTC_DATA_ATTR uint32_t g_timer_wakes  = 0;   // scheduled check-ins
+RTC_DATA_ATTR uint32_t g_captures     = 0;   // successful camera captures (bug 5)
+RTC_DATA_ATTR uint32_t g_push_fails   = 0;   // alert pushes that failed (bug 5): the
+                                             // counters ride every announce's app_data
+                                             // so "capturing but can't push" is visible
+                                             // remotely (07-15: 21 h of failed pushes
+                                             // looked like a quiet cam)
 RTC_DATA_ATTR int64_t  g_unixtime     = 0;   // approx wall clock; 0 = unknown until the
                                              // gateway syncs it (piggybacked on an ACK).
 RTC_DATA_ATTR uint32_t g_last_sleep_s = 0;   // how long we intended to sleep last time
@@ -116,14 +123,16 @@ static bool detector_says_send(const uint8_t* jpeg, size_t len, int w, int h) {
 
 // Radio TX of an alert thumbnail. With LEAF_RADIO the real SX1262 + microReticulum stack
 // (leaf_radio.*) handles it; otherwise log what would go out (camera-only bench builds).
-static void radio_send_alert(const uint8_t* buf, size_t len,
+// Returns false when the push failed (feeds the g_push_fails health counter, bug 5).
+static bool radio_send_alert(const uint8_t* buf, size_t len,
                              const char* event_id, int64_t captured_at) {
 #ifdef LEAF_RADIO
-    leaf_radio_send_alert(buf, len, event_id, captured_at);
+    return leaf_radio_send_alert(buf, len, event_id, captured_at);
 #else
     (void)buf; (void)event_id; (void)captured_at;
     Serial.printf("[leaf] radio -> (stub) would TX alert thumbnail, %u bytes\n",
                   (unsigned)len);
+    return true;   // no radio compiled in: nothing to fail
 #endif
 }
 
@@ -364,6 +373,7 @@ static void on_pir_event() {
     }
     leaf_camera_end(full);              // sensor OFF before the slow stages
     uint32_t cap_ms = millis() - t0;
+    g_captures++;                       // health counter (bug 5): capture succeeded
 
     bool send = detector_says_send(thumb, len, w, h);
 
@@ -381,7 +391,11 @@ static void on_pir_event() {
         // Mesh transport: same bytes as an RNS::Resource to the gateway, wrapped in the
         // metadata envelope so the gateway uploads under the REAL event id (and the
         // serial + mesh copies of the same event dedupe server-side).
-        radio_send_alert(thumb, len, eid, g_unixtime);
+#ifdef LEAF_RADIO
+        leaf_radio_set_health(g_pir_wakes, g_captures, g_push_fails, leaf_read_vbat());
+#endif
+        if (!radio_send_alert(thumb, len, eid, g_unixtime))
+            g_push_fails++;             // health counter (bug 5): push failed
 
         // Store the same-moment full-res, keyed by event_id — it only travels when a
         // fetch_full command asks for it.
@@ -403,6 +417,7 @@ static void on_scheduled_checkin() {
         // Announce only — the mesh command window at the END of every wake does the
         // listening, because the gateway fires queued commands at us the moment it
         // HEARS this announce (announce-handler wake-triggered delivery).
+        leaf_radio_set_health(g_pir_wakes, g_captures, g_push_fails, leaf_read_vbat());
         leaf_radio_announce("checkin");     // heartbeat so the gateway sees us alive
     }
 #else
@@ -414,7 +429,10 @@ static void on_scheduled_checkin() {
 // gateway learns our path.
 static void on_cold_boot() {
 #ifdef LEAF_RADIO
-    if (leaf_radio_begin()) leaf_radio_announce("hello");
+    if (leaf_radio_begin()) {
+        leaf_radio_set_health(g_pir_wakes, g_captures, g_push_fails, leaf_read_vbat());
+        leaf_radio_announce("hello");
+    }
 #else
     Serial.println("[leaf] cold boot -> (stub) full init + mesh announce");
 #endif
@@ -426,6 +444,18 @@ static void on_cold_boot() {
 // service the device (OTA, fetch_full, diagnostics) without racing the 3 s wake window.
 // With WiFi creds in the payload we also join and NTP-sync the clock — real timestamps
 // until the next full power loss. Exits on the deadline or a {"kind":"sleep"} command.
+
+// PIR stays live during the window (2026-07-16 outage, open item 5): ext0 only fires
+// from deep sleep, so a maintenance window used to be a capture blackout — cmd 58's
+// 60 min window silently ate 52 min of walk-bys. A RISING interrupt on the PIR pin
+// feeds the normal capture path, rate-limited to roughly the deep-sleep cycle cadence
+// (capture+detector+send+PIR-drain is ~25 s end to end).
+#ifndef LEAF_MAINT_PIR_REFRACTORY_MS
+#define LEAF_MAINT_PIR_REFRACTORY_MS 30000
+#endif
+static volatile bool s_maint_pir_edge = false;
+static void IRAM_ATTR maint_pir_isr() { s_maint_pir_edge = true; }
+
 static void maintenance_loop(const TcMaintRequest& req) {
     Serial.printf("[maint] entering maintenance mode for %u min (wifi=%s)\n",
                   (unsigned)req.minutes, req.ssid[0] ? req.ssid : "no");
@@ -460,7 +490,42 @@ static void maintenance_loop(const TcMaintRequest& req) {
     const uint32_t start_ms    = millis();
     const uint32_t deadline_ms = req.minutes * 60000UL;
     uint32_t last_announce = 0;
+    // Arm the awake-mode PIR path. The pin is often still HIGH here (this wake was
+    // likely the PIR event itself); RISING means we only fire on the NEXT motion.
+    // ext0 arming routed the pad to the RTC mux, where the digital GPIO matrix (and
+    // attachInterrupt) can't see it — hand it back first. Verified live 2026-07-16:
+    // without the deinit the ISR never fires no matter how much you wave.
+    s_maint_pir_edge = false;
+    uint32_t pir_last_cap = 0;
+    rtc_gpio_deinit(PIR_GPIO);
+    pinMode((int)PIR_GPIO, INPUT);
+    attachInterrupt(digitalPinToInterrupt((int)PIR_GPIO), maint_pir_isr, RISING);
+    // Fold wall time into g_unixtime as we go, not just at exit — a capture in minute 4
+    // of a 5 min window must not carry a start-of-wake timestamp.
+    uint32_t clock_credit_ms = start_ms;
+#ifdef LEAF_RADIO
+    leaf_radio_set_health(g_pir_wakes, g_captures, g_push_fails, leaf_read_vbat());
+#endif
     while (!g_maint_exit && millis() - start_ms < deadline_ms) {
+        if (time(nullptr) > 1700000000) {       // system clock valid (NTP or time_sync)
+            g_unixtime = (int64_t)time(nullptr);
+            clock_credit_ms = millis();
+        } else if (g_unixtime > 0) {
+            uint32_t el = millis() - clock_credit_ms;
+            g_unixtime      += el / 1000;
+            clock_credit_ms += (el / 1000) * 1000;   // keep the sub-second remainder
+        }
+
+        if (s_maint_pir_edge) {
+            s_maint_pir_edge = false;           // edges inside the refractory are dropped
+            if (pir_last_cap == 0 || millis() - pir_last_cap >= LEAF_MAINT_PIR_REFRACTORY_MS) {
+                pir_last_cap = millis();
+                g_pir_wakes++;                  // same health counter as an ext0 wake
+                Serial.println("[maint] PIR edge -> capture (window stays open)");
+                on_pir_event();
+            }
+        }
+
 #ifdef LEAF_RADIO
         // Periodic announce so the gateway keeps seeing us and fires queued mesh
         // commands (its announce-triggered delivery suppresses repeats server-side).
@@ -472,25 +537,37 @@ static void maintenance_loop(const TcMaintRequest& req) {
 #endif
         tc_poll_commands(1000, on_gateway_command);
     }
+    detachInterrupt(digitalPinToInterrupt((int)PIR_GPIO));
 
     // Keep the RTC clock honest for whatever we do next: NTP made it exact; otherwise
-    // credit the time we sat here.
+    // credit the (remaining, uncredited) time we sat here.
     if (ntp_ok) g_unixtime = (int64_t)time(nullptr);
-    else if (g_unixtime > 0) g_unixtime += (millis() - start_ms) / 1000;
+    else if (g_unixtime > 0) g_unixtime += (millis() - clock_credit_ms) / 1000;
     if (req.ssid[0]) { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
     Serial.printf("[maint] maintenance over (%s) -> normal sleep cycle\n",
                   g_maint_exit ? "sleep command" : "deadline");
 }
 
-// Bench-grade clock seed: parse __DATE__/__TIME__ into a unix epoch so captured_at and
-// event_id are real-ish from the first boot (the ingest contract REQUIRES captured_at;
-// the host-bridge rejects frames without it). The build host's local time is compiled in,
-// so LEAF_BUILD_UTC_OFFSET_S corrects it to UTC (default 14400 = EDT). Replaced by real
-// gateway time sync later; drift between syncs is inherent and acceptable.
+// Bench-grade clock seed so captured_at and event_id are real-ish from the first boot
+// (the ingest contract REQUIRES captured_at; the host-bridge rejects frames without it).
+// Replaced by real gateway time sync later.
+//
+// The seed MUST NEVER RUN AHEAD of real time (bug 6, 2026-07-16): announce packets embed
+// the leaf's clock as their emission timestamp, and the gateway's Transport replay guard
+// rejects any announce "older" than the max it has recorded — so a fast seed followed by
+// a corrective (backward) time sync wedges announce processing on the gateway for as
+// long as the seed was fast. Preferred source: LEAF_BUILD_EPOCH, the build host's actual
+// UTC epoch injected by platformio.ini — timezone-proof and always in the past. The
+// __DATE__/__TIME__ parse below is the fallback; its LEAF_BUILD_UTC_OFFSET_S assumed an
+// EDT build host, which made every UTC-built image seed 4 h FAST (measured drift -14027 s
+// on the first gateway sync — the bench reproduction of the 07-15 all-night wedge).
 #ifndef LEAF_BUILD_UTC_OFFSET_S
 #define LEAF_BUILD_UTC_OFFSET_S 14400        // build host is EDT (UTC-4)
 #endif
 static int64_t build_epoch() {
+#ifdef LEAF_BUILD_EPOCH
+    return (int64_t)LEAF_BUILD_EPOCH;
+#else
     static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
     const char m[4] = {__DATE__[0], __DATE__[1], __DATE__[2], 0};
     struct tm tmv = {};
@@ -502,6 +579,7 @@ static int64_t build_epoch() {
     tmv.tm_min  = atoi(__TIME__ + 3);
     tmv.tm_sec  = atoi(__TIME__ + 6);
     return (int64_t)mktime(&tmv) + LEAF_BUILD_UTC_OFFSET_S;   // TZ unset on ESP32 -> UTC
+#endif
 }
 
 // Human tag for the telemetry beacon's boot_reason (matches the ingest contract vocab).
@@ -535,6 +613,10 @@ static void print_status(esp_sleep_wakeup_cause_t cause) {
 // Don't re-arm ext0 while the AM312 output is still HIGH from the event we just handled
 // (~2 s hold) or we'd immediately wake again. Wait for it to settle low (bounded).
 static void wait_pir_low() {
+    // Same RTC-mux gotcha as the maintenance PIR path: after any ext0-armed sleep the
+    // pad is RTC-routed and digitalRead sees a constant 0 — this drain loop was a no-op
+    // on every wake since ext0 was first armed (it only ever worked on cold boot).
+    rtc_gpio_deinit(PIR_GPIO);
     pinMode((int)PIR_GPIO, INPUT);
     uint32_t t0 = millis();
     while (digitalRead((int)PIR_GPIO) == HIGH && millis() - t0 < 6000) delay(20);

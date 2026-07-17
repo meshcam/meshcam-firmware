@@ -131,7 +131,12 @@ board's serial piped over ssh: `ssh <laptop> 'cat /dev/ttyACM0' | uv run serial_
   (`build_epoch()`, `LEAF_BUILD_UTC_OFFSET_S` corrects the build host's EDT to UTC). Timer
   wakes advance it by the slept interval. Bench-grade: a burst of PIR wakes freezes the
   clock (ids stay unique via the counter); real gateway time sync replaces this.
-- Node slug / fw version: `LEAF_NODE_SLUG` (default `c3-back-of-lake`) / `LEAF_FW_VERSION`.
+- Wire identity (leaf-0.15.0, node-identity.md in the homelab tree): the slug is **derived
+  at radio init** — `leaf-` + the first 8 hex of the RNS destination hash (e.g. the office
+  perfboard prototype = `leaf-46c06ddb`) — RTC-cached so pre-radio PIR emissions on later
+  wakes carry it too. Human names live only in the app (rename = the pencil on the node
+  card). A non-empty `LEAF_NODE_SLUG` build flag pins a fixed slug instead (bench debugging
+  only). Event ids use the full slug as prefix. `LEAF_FW_VERSION` as before.
 
 **Downlink (`!TC CMD`) + full-res store filled in + E2E-verified (2026-07-02):** the leaf now
 handles gateway commands relayed by the bridge, and every sent capture also grabs the
