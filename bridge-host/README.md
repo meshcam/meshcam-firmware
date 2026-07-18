@@ -63,6 +63,20 @@ Each command goes to the leaf as a single line:
 !TC CMD {"id":7,"kind":"fetch_full","site":"north40","node":"c3-north-stand","event_id":"c3-1783018946-5","payload":null,"status":"delivered","created_at":"..."}
 ```
 
+**Receipt ack (leaf-0.16.0):** on reading a `CMD` line that carries an `id`,
+the firmware immediately emits one line — before executing the command, since
+receipt is not completion and a `fetch_full` handler can run for minutes:
+
+```
+!TC ACK 7
+```
+
+The bridge relays it to `POST /api/v1/commands/{id}/ack {"status":"received"}`,
+which stops server-side redelivery (the mesh path does the same via the leaf's
+`a=<id>` announce tail, relayed by the gateway). Lost acks self-heal: the
+server keeps re-delivering, the leaf re-acks on its next window, and the
+endpoint never regresses a command that already finished.
+
 **Firmware handling:** on `kind:"fetch_full"`, re-send the stored full-res JPEG
 for that `event_id` as a normal `EVT` frame with `"kind":"full"`. ⚠️ **It must be
 the STORED ORIGINAL frame saved to SD at capture time; do NOT re-capture.**
@@ -78,9 +92,9 @@ setting (FRAMESIZE_* + jpeg_quality). Pick it consciously: on the USB bench
 bigger is free, but over LoRa a QXGA JPEG (~200-400 KB) is many minutes of
 airtime per photo; size the deployed full-res for what the mesh can afford,
 not the sensor max. That ingest
-automatically completes the command server-side, no ack needed, and repeats
-are harmless (the server re-delivers until the full-res lands, the upload is
-idempotent). Unknown `kind`s should be ignored (forward compat). Commands the
+automatically completes the command server-side (the receipt ack above only
+marks it `received`), and repeats are harmless (the server re-delivers until
+the full-res lands, the upload is idempotent). Unknown `kind`s should be ignored (forward compat). Commands the
 mesh never satisfies expire server-side after 14 days.
 
 In the UI this is the "📡 Request full-res" button on any photo that only has

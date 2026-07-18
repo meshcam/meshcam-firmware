@@ -38,6 +38,21 @@ bool leaf_radio_set_profile(uint8_t idx) {
 
 const char* leaf_radio_profile_name() { return LORA_PROFILES[s_profile].name; }
 
+// TX power (tx-power calibration, 2026-07-18). Same stage-or-live shape as
+// set_profile(): callable before begin() (stages for radio init) or after (pokes
+// the live SX1262). s_tx_dbm mirrors the interface so the announce tail can
+// report the power actually in use.
+static int s_tx_dbm = LORA_TX_DBM;
+
+bool leaf_radio_set_tx_dbm(int dbm) {
+    if (LoRaInterface::active && !LoRaInterface::active->set_tx_dbm(dbm))
+        return false;
+    s_tx_dbm = dbm;
+    return true;
+}
+
+int leaf_radio_tx_dbm() { return s_tx_dbm; }
+
 bool leaf_radio_had_contact() { return s_contact; }
 
 // App namespace for the leaf's IN destination. The destination hash derives from this +
@@ -122,6 +137,10 @@ bool leaf_radio_begin() {
     // LoRaInterface::active.
     if (s_profile != LORA_PROFILE_BASE && LoRaInterface::active)
         LoRaInterface::active->set_profile(s_profile);
+    // Same for a staged TX power override (tx-power sweep): begin() must already
+    // transmit at it, announce included.
+    if (s_tx_dbm != LORA_TX_DBM && LoRaInterface::active)
+        LoRaInterface::active->set_tx_dbm(s_tx_dbm);
     lora_interface.mode(RNS::Type::Interface::MODE_GATEWAY);  // relays; power-mode tuning TBD
     RNS::Transport::register_interface(lora_interface);
     s_radio = lora_interface.start();
@@ -166,6 +185,10 @@ void leaf_radio_announce(const char* status) {
     // never eat it.
     if (n >= 0 && n < (int)sizeof(ad))
         n += snprintf(ad + n, sizeof(ad) - n, " n=%s", tc_node_slug());
+    // TX power in use (tx-power calibration): lets gateway-side telemetry attribute
+    // each checkin's RSSI to the power it was sent at. Cheap (6 bytes), always on.
+    if (n >= 0 && n < (int)sizeof(ad))
+        n += snprintf(ad + n, sizeof(ad) - n, " tx=%d", s_tx_dbm);
     if (s_h_set && n >= 0 && n < (int)sizeof(ad)) {
         n += snprintf(ad + n, sizeof(ad) - n, " p=%lu c=%lu f=%lu",
                       (unsigned long)s_h_pir, (unsigned long)s_h_cap,
@@ -222,6 +245,8 @@ static bool pump_until(volatile bool* flag, uint32_t ms) {
     return flag && *flag;
 }
 
+static void on_gw_link_packet(const RNS::Bytes& plaintext, const RNS::Packet& packet);
+
 // Establish (or reuse) the link to the baked gateway destination. Gate A findings as
 // policy: rate-limited path requests (an every-loop request keeps the half-duplex radio
 // deaf), full teardown + ONE in-wake retry on failure (second handshakes land).
@@ -253,7 +278,10 @@ static bool establish_gateway_link() {
         s_gw_link = RNS::Link(gw_dest);
         s_gw_link.set_link_established_callback(on_gw_link_established);
         s_gw_link.set_link_closed_callback(on_gw_link_closed);
-        if (pump_until(&s_gw_link_up, 15000)) return true;
+        if (pump_until(&s_gw_link_up, 15000)) {
+            s_gw_link.set_packet_callback(on_gw_link_packet);   // "have?" replies
+            return true;
+        }
         Serial.printf("[radio] gateway link FAILED to establish (attempt %d) -> teardown\n", attempt);
         s_gw_link.teardown();
         s_gw_link = RNS::Link({RNS::Type::NONE});
@@ -267,6 +295,49 @@ static void teardown_gateway_link() {
     if (s_gw_link) s_gw_link.teardown();
     s_gw_link = RNS::Link({RNS::Type::NONE});
     s_gw_link_up = false;
+}
+
+// --- transfer dedup ("have?" protocol, leaf-0.17.0) ------------------------------------
+// A lost RNS conclusion ack used to mean a full re-transfer of data the gateway already
+// holds — the 07-17 walk's "battery-life bug wearing a range bug's clothing". Before
+// committing a Resource, ask over the link what the gateway has: one tiny packet each
+// way vs 30-160 s of re-sent chunks. No reply (old gateway firmware, lost packet) fails
+// OPEN to sending — exactly the pre-0.17 behavior.
+static volatile bool s_have_reply = false;
+static char          s_have_json[224];
+
+static void on_gw_link_packet(const RNS::Bytes& plaintext, const RNS::Packet& /*packet*/) {
+    size_t n = plaintext.size();
+    if (n >= sizeof(s_have_json)) n = sizeof(s_have_json) - 1;
+    memcpy(s_have_json, plaintext.data(), n);
+    s_have_json[n] = 0;
+    s_have_reply = true;
+}
+
+static bool query_gateway_have(const char* eid, const char* kind,
+                               bool* complete, uint32_t* got_mask) {
+    *complete = false;
+    *got_mask = 0;
+    if (!eid || !eid[0] || !s_gw_link || !s_gw_link_up) return false;
+    char q[128];
+    int n = snprintf(q, sizeof(q),
+                     "{\"q\":\"have\",\"event_id\":\"%s\",\"kind\":\"%s\"}", eid, kind);
+    s_have_reply = false;
+    RNS::Packet(s_gw_link, RNS::Bytes((const uint8_t*)q, (size_t)n)).send();
+    if (!pump_until(&s_have_reply, 4000)) {
+        Serial.println("[radio] have? no reply -> fail-open send");
+        return false;
+    }
+    // The echo must match — a stale reply for another event must never skip this one.
+    if (!strstr(s_have_json, eid)) return false;
+    const char* t;
+    if ((t = strstr(s_have_json, "\"complete\":")))
+        *complete = atoi(t + 11) != 0;
+    if ((t = strstr(s_have_json, "\"got_mask\":")))
+        *got_mask = (uint32_t)strtoul(t + 11, nullptr, 10);
+    Serial.printf("[radio] have? %s %s -> complete=%d mask=0x%lx\n",
+                  eid, kind, (int)*complete, (unsigned long)*got_mask);
+    return true;
 }
 
 // One enveloped Resource over the (established) gateway link. Blocks to conclusion.
@@ -316,6 +387,21 @@ bool leaf_radio_send_alert(const uint8_t* buf, size_t len,
     }
     Serial.println("[radio] gateway link up, pushing thumbnail as Resource");
 
+    // Dedup first: if the gateway already took custody of this thumb (we lost the
+    // conclusion ack last attempt), the whole push is one packet round trip.
+    {
+        bool have = false;
+        uint32_t mask = 0;
+        query_gateway_have(event_id, "thumb", &have, &mask);
+        if (have) {
+            Serial.printf("[radio] gateway already has thumb %s -> push skipped (dedup)\n",
+                          event_id);
+            teardown_gateway_link();
+            leaf_radio_announce(status);
+            return true;
+        }
+    }
+
     // 3. The thumbnail as one enveloped Resource (JSON header + '\n' + JPEG) so the
     //    gateway uploads under the leaf's REAL event id — that's what lets a fetch_full
     //    for this photo find the stored full on OUR SD card, and what dedupes the
@@ -353,8 +439,27 @@ bool leaf_radio_send_full(const uint8_t* buf, size_t len, const char* event_id,
     const unsigned chunks = (len + LEAF_MESH_CHUNK - 1) / LEAF_MESH_CHUNK;
     Serial.printf("[radio] send_full %s: %u bytes as %u chunk(s), quality=%s\n",
                   event_id, (unsigned)len, chunks, quality);
+    // Dedup / resume: a previous attempt's chunks may already sit in the gateway's
+    // assembly (its got_mask survives between our wakes), or the whole full may be
+    // in custody with only our conclusion ack lost. Mask is only trustworthy when
+    // every chunk index fits in it.
+    bool     have = false;
+    uint32_t mask = 0;
+    query_gateway_have(event_id, "full", &have, &mask);
+    if (have) {
+        Serial.printf("[radio] gateway already has full %s -> send skipped (dedup)\n",
+                      event_id);
+        teardown_gateway_link();
+        return true;
+    }
+    if (chunks > 32) mask = 0;
     bool ok = true;
     for (unsigned i = 0; i < chunks && ok; i++) {
+        if (i < 32 && (mask & (1UL << i))) {
+            Serial.printf("[radio] send_full %s: chunk %u/%u already at gateway -> skipped\n",
+                          event_id, i + 1, chunks);
+            continue;
+        }
         const size_t off  = (size_t)i * LEAF_MESH_CHUNK;
         const size_t blen = min((size_t)LEAF_MESH_CHUNK, len - off);
         char hdr[224];
@@ -369,7 +474,23 @@ bool leaf_radio_send_full(const uint8_t* buf, size_t len, const char* event_id,
         ok = send_one_resource(hdr, (size_t)hlen, buf + off, blen, 300000);
         Serial.printf("[radio] send_full %s: chunk %u/%u %s\n",
                       event_id, i + 1, chunks, ok ? "OK" : "FAILED");
-        if (!ok && establish_gateway_link()) {   // one re-link + retry of this chunk
+        if (!ok && establish_gateway_link()) {
+            // Before re-sending, ask what actually landed: a "failed" chunk whose
+            // conclusion ack got lost is already in the assembly (the exact waste
+            // this protocol exists to kill).
+            bool rhave = false;
+            uint32_t rmask = 0;
+            if (query_gateway_have(event_id, "full", &rhave, &rmask)) {
+                if (rhave) { ok = true; break; }   // custody taken; nothing left to send
+                if (i < 32 && (rmask & (1UL << i))) {
+                    Serial.printf("[radio] send_full %s: chunk %u/%u landed despite "
+                                  "lost ack -> not re-sent\n", event_id, i + 1, chunks);
+                    mask = rmask;
+                    ok = true;
+                    continue;
+                }
+                if (chunks <= 32) mask = rmask;   // resume with fresh gateway state
+            }
             ok = send_one_resource(hdr, (size_t)hlen, buf + off, blen, 300000);
             Serial.printf("[radio] send_full %s: chunk %u/%u retry %s\n",
                           event_id, i + 1, chunks, ok ? "OK" : "FAILED");

@@ -52,7 +52,7 @@
 #define GW_SITE "home"
 #endif
 #ifndef GW_FW_VERSION
-#define GW_FW_VERSION "gateway-0.11.2"
+#define GW_FW_VERSION "gateway-0.14.0"
 #endif
 #ifndef GW_VIEW_HOST
 #define GW_VIEW_HOST "trailcam.example.com"   // family gallery shown on the OLED
@@ -315,9 +315,39 @@ static void log_event(const char* fmt, ...) {
     s_evt_head = (s_evt_head + 1) % GW_EVT_SLOTS;
 }
 
-// --- ADR (adaptive radio profile, gateway-0.4.0) ----------------------------------------
-// The gateway is the ADR decision-maker: it measures the SNR of the leaf's announces and
-// grants profile switches by index into the shared table (lib/lora_interface/
+// --- /debuglog ring (bug 6): RNS NOTICE+ lines and microStore events, cable-free -------
+// The 07-15/16 announce wedge dropped announces on branches that logged at DEBUG or not
+// at all, and the gateway rarely has a serial cable attached in the field. Patch 5/6
+// (patch_microreticulum.py) elevate those branches to NOTICE / USTORE_LOG; this ring
+// captures both so `curl /debuglog` reads the story remotely. Sized for ~30 min of
+// NOTICE-rate traffic; the interesting lines (wedge gates, store compaction) are rare.
+static constexpr int DBGLOG_N = 96, DBGLOG_W = 128;
+static char     s_dbglog[DBGLOG_N][DBGLOG_W];
+static uint32_t s_dbglog_ms[DBGLOG_N];
+static uint32_t s_dbglog_seq = 0;   // total lines ever pushed; slot = seq % DBGLOG_N
+static void dbglog_push(const char* line) {
+    const uint32_t slot = s_dbglog_seq % DBGLOG_N;
+    snprintf(s_dbglog[slot], DBGLOG_W, "%s", line);
+    size_t n = strlen(s_dbglog[slot]);
+    if (n && s_dbglog[slot][n - 1] == '\n') s_dbglog[slot][n - 1] = 0;
+    s_dbglog_ms[slot] = millis();
+    s_dbglog_seq++;
+}
+static void rns_log_cb(const char* msg, RNS::LogLevel level) {
+    if (level <= RNS::LOG_NOTICE) dbglog_push(msg);   // CRITICAL..NOTICE only
+}
+extern "C" void ustore_log_hook(const char* fmt, ...) {   // microStore Log.h patch calls this
+    char buf[DBGLOG_W];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    dbglog_push(buf);
+}
+
+// --- ADR (adaptive radio profile, gateway-0.4.0; RSSI-driven since 0.12.0) --------------
+// The gateway is the ADR decision-maker: it measures the RSSI + SNR of the leaf's direct
+// announces and grants profile switches by index into the shared table (lib/lora_interface/
 // lora_profiles.h) via {"kind":"radio_profile"} packets into the leaf's RX window. The
 // full state machine (grant -> confirm-or-revert, TTL refresh, scan fallback) lives in
 // the rf_* functions below the command plumbing; this block is the state + helpers the
@@ -332,9 +362,26 @@ struct RfState {
              last_grant_tx_ms = 0, last_scan_ms = 0;
     uint8_t  announces_since_tx = 0;       // announces heard since our last grant TX
     float    snr[5];                       // rolling announce SNR at the CURRENT profile
+    float    rssi[5];                      // rolling announce RSSI (same samples)
     uint8_t  snr_n = 0, snr_i = 0;
+    uint8_t  up_reverts = 0;               // consecutive up-shift grants never confirmed
+    uint32_t up_revert_ms = 0;             // when the last one timed out
 };
 static RfState s_rf;
+
+// Survey/commissioning hold (gateway-0.13.0): POST /rf/base parks the radio on base
+// AND suspends ADR for a window, so the site stays audible on base long enough to
+// enroll a new leaf or run a surveyor walk — without it, a single-leaf site re-grants
+// itself up within a few announces and goes deaf on base again. 0 = no hold. The
+// signed-diff compare survives millis() wrap; rf_loop() clears it on expiry.
+#ifndef GW_RF_BASE_HOLD_DEFAULT_MIN
+#define GW_RF_BASE_HOLD_DEFAULT_MIN 15
+#endif
+#define GW_RF_BASE_HOLD_MAX_MIN     240
+static uint32_t s_rf_hold_until = 0;
+static bool rf_hold_active() {
+    return s_rf_hold_until && (int32_t)(s_rf_hold_until - millis()) > 0;
+}
 
 // DIRECT frames only (bug 1, 2026-07-16): a transport relay (the surveyor; the dam
 // spine's R1/R2 later) can deliver the leaf's announces across a radio-profile split,
@@ -346,14 +393,20 @@ static void rf_note_leaf_heard() {
     if (LoRaInterface::last_hops == 0) s_rf.last_leaf_ms = millis();
 }
 static void rf_clear_snr() { s_rf.snr_n = 0; s_rf.snr_i = 0; }
-static void rf_push_snr(float snr) {
-    s_rf.snr[s_rf.snr_i] = snr;
+static void rf_push_link(float snr, float rssi) {
+    s_rf.snr[s_rf.snr_i]  = snr;
+    s_rf.rssi[s_rf.snr_i] = rssi;
     s_rf.snr_i = (s_rf.snr_i + 1) % 5;
     if (s_rf.snr_n < 5) s_rf.snr_n++;
 }
 static float rf_avg_snr() {
     float sum = 0;
     for (uint8_t i = 0; i < s_rf.snr_n; i++) sum += s_rf.snr[i];
+    return s_rf.snr_n ? sum / s_rf.snr_n : NAN;
+}
+static float rf_avg_rssi() {
+    float sum = 0;
+    for (uint8_t i = 0; i < s_rf.snr_n; i++) sum += s_rf.rssi[i];
     return s_rf.snr_n ? sum / s_rf.snr_n : NAN;
 }
 static const char* rf_name(uint8_t idx) { return LORA_PROFILES[idx].name; }
@@ -386,6 +439,12 @@ static void web_root() {
            "td{padding:2px 10px;border-bottom:1px solid #333}.t{color:#888}</style>"
            "<h1>trailcam gateway — live mesh</h1><p>");
     char line[380];
+    char rftag[28] = "";
+    if (s_rf.pending != 0xFF) strcpy(rftag, " (confirming)");
+    else if (s_rf.scanning)   strcpy(rftag, " (scanning)");
+    else if (rf_hold_active())
+        snprintf(rftag, sizeof(rftag), " (base hold %lum left)",
+                 (unsigned long)((s_rf_hold_until - millis()) / 60000u + 1));
     char clock[32] = "clock NOT SYNCED";
     {
         time_t now = time(nullptr);
@@ -402,7 +461,7 @@ static void web_root() {
              (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(),
              (unsigned)((LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024), clock,
              s_radio_ok ? LORA_PROFILES[s_rf.current].name : "ABSENT — wire the SX1262",
-             s_rf.pending != 0xFF ? " (confirming)" : (s_rf.scanning ? " (scanning)" : ""),
+             rftag,
              LoRaInterface::last_rssi, LoRaInterface::last_snr,
              (unsigned long)s_stats.announces, (unsigned long)LoRaInterface::announces_seen,
              (unsigned long)s_stats.announces_relayed, (unsigned long)s_stats.announces_foreign,
@@ -553,6 +612,37 @@ static void pending_clear() {
     s_pending = PendingUpload();
 }
 
+// --- transfer dedup ("have?" protocol, gateway-0.14.0) ---------------------------------
+// The envelope header travels INSIDE the Resource payload, so the gateway can't refuse
+// a duplicate until the whole thing has already burned its airtime. Instead the leaf
+// asks first, with a tiny packet over the link: {"q":"have","event_id":..,"kind":..}.
+// We answer from a ring of transfers we've taken custody of, plus the live assembly's
+// chunk bitmask — so a leaf that lost the RNS conclusion ack (the classic edge-of-range
+// shape, 07-17 walk) pays one packet round trip instead of a full re-transfer. RAM-only
+// by design: a gateway reboot forgets, the leaf's query times out, and it fails open to
+// sending. Custody = queued for upload here; the WiFi leg has its own retry loop.
+#define GW_HAVE_RING 12
+struct HaveEntry { char event_id[48]; char kind[8]; };
+static HaveEntry s_have[GW_HAVE_RING];
+static int       s_have_next = 0;
+
+static void have_note(const char* eid, const char* kind) {
+    if (!eid || !eid[0]) return;
+    for (int i = 0; i < GW_HAVE_RING; i++)
+        if (strcmp(s_have[i].event_id, eid) == 0 && strcmp(s_have[i].kind, kind) == 0)
+            return;
+    snprintf(s_have[s_have_next].event_id, sizeof(s_have[0].event_id), "%s", eid);
+    snprintf(s_have[s_have_next].kind,     sizeof(s_have[0].kind),     "%s", kind);
+    s_have_next = (s_have_next + 1) % GW_HAVE_RING;
+}
+
+static bool have_check(const char* eid, const char* kind) {
+    for (int i = 0; i < GW_HAVE_RING; i++)
+        if (strcmp(s_have[i].event_id, eid) == 0 && strcmp(s_have[i].kind, kind) == 0)
+            return true;
+    return false;
+}
+
 // Take ownership of a bare-JPEG buffer + metadata (zero-copy for thumbs).
 static void queue_upload_owned(uint8_t* jpeg, size_t len, const char* eid,
                                const char* cam, const char* kind, long long capts) {
@@ -567,6 +657,7 @@ static void queue_upload_owned(uint8_t* jpeg, size_t len, const char* eid,
     snprintf(s_pending.kind,     sizeof(s_pending.kind),     "%s", kind);
     s_pending.captured_at = capts;
     note_capture(cam, eid);
+    have_note(eid, kind);
 }
 
 // File-backed variant: the body already sits at GW_SPOOL_JPG (a completed assembly);
@@ -584,6 +675,7 @@ static void queue_upload_spooled(size_t len, const char* eid,
     snprintf(s_pending.kind,     sizeof(s_pending.kind),     "full");
     s_pending.captured_at = capts;
     note_capture(cam, eid);
+    have_note(eid, "full");
 }
 
 // Single-Resource path: peel the envelope (or synthesize legacy metadata) and copy
@@ -831,6 +923,38 @@ static void on_resource_concluded(const RNS::Resource& resource) {
     queue_upload(d.data(), d.size());
 }
 
+// "have?" query arriving as a small packet over the link (see the dedup block above).
+// Reply goes back over the same link — this gateway services one leaf link at a time,
+// and latest_link IS the link this packet arrived on.
+static void on_link_packet(const RNS::Bytes& plaintext, const RNS::Packet& /*packet*/) {
+    char q[16] = "", eid[48] = "", kind[8] = "";
+    std::string js((const char*)plaintext.data(),
+                   std::min(plaintext.size(), (size_t)200));
+    json_str(js.c_str(), "q", q, sizeof(q));
+    if (strcmp(q, "have") != 0) return;   // not ours; other link packets stay possible
+    json_str(js.c_str(), "event_id", eid, sizeof(eid));
+    json_str(js.c_str(), "kind", kind, sizeof(kind));
+    if (!eid[0] || !kind[0]) return;
+    const bool complete = have_check(eid, kind);
+    uint32_t mask = 0;
+    unsigned chunks = 0;
+    if (!complete && strcmp(kind, "full") == 0 && asm_active() &&
+        strcmp(s_asm.event_id, eid) == 0) {
+        mask   = s_asm.got_mask;
+        chunks = s_asm.chunks;
+    }
+    char reply[160];
+    snprintf(reply, sizeof(reply),
+             "{\"a\":\"have\",\"event_id\":\"%s\",\"kind\":\"%s\","
+             "\"complete\":%d,\"got_mask\":%lu,\"chunks\":%u}",
+             eid, kind, complete ? 1 : 0, (unsigned long)mask, chunks);
+    RNS::Packet(latest_link, RNS::Bytes((const uint8_t*)reply, strlen(reply))).send();
+    Serial.printf("[gw] have? %s %s -> %s%s\n", eid, kind,
+                  complete ? "COMPLETE (dedup save)" : "miss",
+                  mask ? " (partial mask sent)" : "");
+    if (complete) log_event("dedup: %s %s already held, re-send skipped", eid, kind);
+}
+
 static void on_link_established(RNS::Link& link) {
     Serial.println("[gw] leaf linked");
     rf_note_leaf_heard();
@@ -845,6 +969,7 @@ static void on_link_established(RNS::Link& link) {
     link.set_resource_strategy(RNS::Type::Link::ACCEPT_ALL);
     link.set_resource_started_callback(on_resource_started);
     link.set_resource_concluded_callback(on_resource_concluded);
+    link.set_packet_callback(on_link_packet);
 }
 
 // --- command downlink: poll the API, deliver to the leaf the moment it announces -------
@@ -1044,11 +1169,12 @@ public:
         LeafEntry& L = s_roster[idx];
         L.identity        = announced_identity;
         L.announce_direct = direct;
-        // Empty-app_data announces are real protocol frames — path responses, link
-        // handshakes, and relayed copies whose app_data doesn't survive the hop
-        // (microReticulum quirk, see the roster bench notes). The leaf IS awake, so
-        // delivery below still runs, but don't let them wipe the entry's last-known
-        // status/health.
+        // Empty-app_data announces are real protocol frames — path responses and
+        // link handshakes genuinely carry none. (Relayed copies used to lose theirs
+        // too, but that was the recall-cache starvation fixed by microReticulum
+        // patch 4 — app_data now parses from the frame and survives relay hops.)
+        // The leaf IS awake, so delivery below still runs, but don't let them wipe
+        // the entry's last-known status/health.
         if (status[0]) {
             snprintf(L.status, sizeof(L.status), "%s", status);
             snprintf(L.health, sizeof(L.health), "%s", htail);
@@ -1076,7 +1202,8 @@ public:
         rf_note_leaf_heard();   // no-op for relayed frames (bug 1)
         // ADR SNR samples must measure the DIRECT leaf<->gateway link — a relayed
         // announce's SNR is the relay's link and poisons grant decisions (bug 1).
-        if (direct && !isnan(LoRaInterface::last_snr)) rf_push_snr(LoRaInterface::last_snr);
+        if (direct && !isnan(LoRaInterface::last_snr))
+            rf_push_link(LoRaInterface::last_snr, LoRaInterface::last_rssi);
         log_event("announce %s %s (rssi %.0f%s)", L.slug[0] ? L.slug : "leaf", status,
                   LoRaInterface::last_rssi, direct ? "" : ", RELAYED");
         // Attach the raw frame we are processing RIGHT NOW (the announce handler
@@ -1094,6 +1221,10 @@ public:
         // stores in the telemetry column / last_battery_v (extra.health is opaque
         // JSON to the ingest path), so without it the UI shows "external power".
         char batt[24] = "";
+        // TX power the leaf says it sent this announce at ("tx=<dbm>", leaf tx-power
+        // calibration 2026-07-18) -> extra.tx_dbm, so RSSI rows are attributable to
+        // the power that produced them.
+        char txkv[24] = "";
         if (htail[0]) {
             long p = -1, c = -1, f = -1;
             float vb = NAN;
@@ -1102,30 +1233,36 @@ public:
             if ((t = strstr(htail, "c=")))  c  = atol(t + 2);
             if ((t = strstr(htail, "f=")))  f  = atol(t + 2);
             if ((t = strstr(htail, "vb=")))              vb = atof(t + 3);
-            int n = snprintf(health, sizeof(health),
-                             ",\"health\":{\"pir_wakes\":%ld,\"captures\":%ld,\"push_fails\":%ld",
-                             p, c, f);
-            if (!isnan(vb) && n > 0 && n < (int)sizeof(health))
-                n += snprintf(health + n, sizeof(health) - n, ",\"battery_v\":%.2f", vb);
+            if ((t = strstr(htail, "tx=")))
+                snprintf(txkv, sizeof(txkv), ",\"tx_dbm\":%ld", atol(t + 3));
+            // Only leaves that actually sent the health counters get a health object
+            // (a tail can now be just "n=<slug> tx=<dbm>").
+            if (p >= 0 || c >= 0 || f >= 0) {
+                int n = snprintf(health, sizeof(health),
+                                 ",\"health\":{\"pir_wakes\":%ld,\"captures\":%ld,\"push_fails\":%ld",
+                                 p, c, f);
+                if (!isnan(vb) && n > 0 && n < (int)sizeof(health))
+                    n += snprintf(health + n, sizeof(health) - n, ",\"battery_v\":%.2f", vb);
+                if (n > 0 && n < (int)sizeof(health)) snprintf(health + n, sizeof(health) - n, "}");
+            }
             if (!isnan(vb))
                 snprintf(batt, sizeof(batt), ",\"battery_v\":%.2f", vb);
-            if (n > 0 && n < (int)sizeof(health)) snprintf(health + n, sizeof(health) - n, "}");
         }
         if (isnan(LoRaInterface::last_rssi))
             queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\"%s,"
-                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s,"
+                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s%s,"
                        "\"packet\":{\"len\":%u,\"hex\":\"%s\"}}}",
                        GW_SITE, L.slug[0] ? L.slug : gw_fallback_camera(), batt, status,
-                       (unsigned)LoRaInterface::last_hops, health,
+                       (unsigned)LoRaInterface::last_hops, health, txkv,
                        (unsigned)LoRaInterface::last_frame_len, hexbuf);
         else
             queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\"%s,"
                        "\"rssi\":%.0f,\"snr\":%.1f,"
-                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s,"
+                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s%s,"
                        "\"packet\":{\"len\":%u,\"hex\":\"%s\"}}}",
                        GW_SITE, L.slug[0] ? L.slug : gw_fallback_camera(), batt,
                        LoRaInterface::last_rssi, LoRaInterface::last_snr, status,
-                       (unsigned)LoRaInterface::last_hops, health,
+                       (unsigned)LoRaInterface::last_hops, health, txkv,
                        (unsigned)LoRaInterface::last_frame_len, hexbuf);
     }
 };
@@ -1255,33 +1392,66 @@ static void maybe_time_sync(LeafEntry& L) {
 }
 
 // --- ADR state machine -------------------------------------------------------------------
-// Grant policy: rolling announce SNR vs the profile table's demod floors. Upgrade one
-// step only with >= 12 dB headroom above the FASTER profile's floor; downgrade one step
-// at <= 6 dB above the CURRENT floor (asymmetric on purpose: slow to speed up, fast to
+// Grant policy (reworked 0.12.0 — probe-analysis.md finding 1: the SNR-only loop was a
+// constant function, 534/534 grants to sf7/bw250, down-shift unreachable): rolling
+// announce RSSI vs the profile table's sensitivity floors is the primary input, because
+// the SX126x SNR readout saturates ~+13 dB and carries no information at real distances.
+// The uplink we measure is the STRONG half of the link — the grant governs both
+// directions and the downlink measured ~13 dB weaker with TX power already matched
+// (probes 30-34) — so uplink RSSI is derated by GW_RF_DOWNLINK_ASYM_DB into a downlink
+// estimate before comparing against the floors. SNR stays as a second gate: an
+// interference-limited link can read strong RSSI with no demod margin, and that is
+// exactly the regime SNR still sees. Upgrade one step only when BOTH inputs have
+// >= 12 dB headroom above the FASTER profile's floor; downgrade one step when EITHER
+// has <= 6 dB above the CURRENT floor (asymmetric on purpose: slow to speed up, fast to
 // slow down). The lockstep dance: send the grant into the RX window, retune ourselves
 // immediately, and expect the leaf's confirm announce ON THE NEW PROFILE — no confirm in
 // 20 s means the grant packet was lost, so revert (the leaf never heard it and is still
 // on the old profile). Every failure path converges both ends back to base: the leaf
 // reverts on TTL expiry / contactless wakes / power loss, we revert on confirm timeout
-// and scan between granted-and-base when the leaf goes quiet off-base.
+// and scan between granted-and-base when the leaf goes quiet off-base. Up-shift grants
+// ride the weak downlink, and 33% of them historically never landed — after
+// GW_RF_UP_REVERTS_MAX consecutive confirm-timeouts, up-shifts hold off for
+// GW_RF_UP_BACKOFF_MS instead of churning (down-shifts are the safety direction and
+// are never blocked).
 #define GW_RF_SNR_SAMPLES_MIN     3
 #define GW_RF_UP_HEADROOM_DB      12.0f
 #define GW_RF_DOWN_HEADROOM_DB    6.0f
+#ifndef GW_RF_DOWNLINK_ASYM_DB
+#define GW_RF_DOWNLINK_ASYM_DB    13.0f            // FIELD-VALIDATED 07-17 range walk:
+#endif                                             // true asym is level-dependent (-15 dB
+                                                   // strong -> -8 dB at the edge), i.e.
+                                                   // 6-9 dB at the decision thresholds --
+                                                   // 13 is deliberately ~5 dB conservative
+                                                   // (safety direction; completion is
+                                                   // contention-limited before RSSI-limited
+                                                   // anyway). Data: homelab
+                                                   // docs/trailcam/adr-field-calibration.md
+                                                   // (build-flag override: bench tests
+                                                   // fake a huge asym to force down-shifts
+                                                   // at desk RSSI)
+#define GW_RF_UP_REVERTS_MAX      2
+#define GW_RF_UP_BACKOFF_MS       (30 * 60 * 1000u)
 #define GW_RF_CONFIRM_TIMEOUT_MS  20000u
 #define GW_RF_SWITCH_COOLDOWN_MS  60000u
 #define GW_RF_GRANT_TTL_S         (24 * 3600)      // matches the leaf's default
 #define GW_RF_SCAN_SILENT_MS      (90 * 1000u)     // leaf quiet this long off-base -> scan
 #define GW_RF_SCAN_TOGGLE_MS      (30 * 1000u)
 
-static void rf_beat(const char* event, uint8_t idx, float snr, float headroom) {
-    // snr/headroom are optional (NAN = omit). %.1f of NAN prints "nan" — invalid JSON
-    // that the telemetry endpoint rejects — so the fields are appended conditionally.
-    char opt[48] = "";
-    if (!isnan(snr)) {
-        int n = snprintf(opt, sizeof(opt), ",\"snr\":%.1f", snr);
-        if (!isnan(headroom) && n > 0 && n < (int)sizeof(opt))
-            snprintf(opt + n, sizeof(opt) - n, ",\"headroom\":%.1f", headroom);
-    }
+static void rf_beat(const char* event, uint8_t idx, float snr, float rssi,
+                    float headroom) {
+    // snr/rssi/headroom are optional (NAN = omit). %.1f of NAN prints "nan" — invalid
+    // JSON that the telemetry endpoint rejects — so the fields are appended
+    // conditionally. rssi is in the beat so the range re-walk can calibrate the 0.12.0
+    // floors/asymmetry against what the decision loop actually saw.
+    char opt[72] = "";
+    int  n = 0;
+    if (!isnan(snr))
+        n += snprintf(opt + n, sizeof(opt) - n, ",\"snr\":%.1f", snr);
+    if (!isnan(rssi) && n < (int)sizeof(opt))
+        n += snprintf(opt + n, sizeof(opt) - n, ",\"rssi\":%.1f", rssi);
+    if (!isnan(headroom) && n >= 0 && n < (int)sizeof(opt))
+        snprintf(opt + n, sizeof(opt) - n, ",\"headroom\":%.1f", headroom);
     // Gateway self-beat: ADR decisions (scan/grant/confirm/revert) are made BY the
     // gateway; they were only ever filed under a camera because a node string was needed.
     queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
@@ -1316,7 +1486,9 @@ static void rf_on_leaf_announce(bool direct) {
         rf_persist(s_rf.granted);
         Serial.printf("[gw] ADR: leaf CONFIRMED on %s\n", rf_name(s_rf.granted));
         log_event("ADR confirmed %s", rf_name(s_rf.granted));
-        rf_beat("confirmed", s_rf.granted, LoRaInterface::last_snr, NAN);
+        rf_beat("confirmed", s_rf.granted, LoRaInterface::last_snr,
+                LoRaInterface::last_rssi, NAN);
+        s_rf.up_reverts = 0;   // a landed grant resets the failed-up-shift backoff
         arm_urgent_sync_all();   // bug 10: fresh profile -> resync the leaf clocks
     }
     if (s_rf.scanning) {
@@ -1329,7 +1501,8 @@ static void rf_on_leaf_announce(bool direct) {
         Serial.printf("[gw] ADR: scan found the leaf on %s -> adopted\n",
                       rf_name(s_rf.granted));
         log_event("ADR scan: leaf found on %s", rf_name(s_rf.granted));
-        rf_beat("adopted", s_rf.granted, LoRaInterface::last_snr, NAN);
+        rf_beat("adopted", s_rf.granted, LoRaInterface::last_snr,
+                LoRaInterface::last_rssi, NAN);
         // Bug 10: scan-adopt IS the cold-boot-under-standing-grant path — the "hello"
         // announce came and went on a profile we weren't parked on, so the one-shot
         // hello sync never fired and the leaf is running its build-epoch clock.
@@ -1360,10 +1533,14 @@ static void maybe_grant_profile(LeafEntry& L, int cmds_sent) {
                           "to %s (grants suspended)\n", s_roster_n,
                           rf_name(LORA_PROFILE_BASE));
             log_event("ADR: multi-leaf -> base, grants suspended");
-            rf_beat("multi_leaf_base", LORA_PROFILE_BASE, NAN, NAN);
+            rf_beat("multi_leaf_base", LORA_PROFILE_BASE, NAN, NAN, NAN);
         }
         return;
     }
+    // Operator hold: parked on base for surveying/commissioning — no grants, no
+    // keepalives, just listen. (Sits after the multi-leaf walk-back on purpose: a
+    // member still holding an old grant gets actively told "base" even mid-hold.)
+    if (rf_hold_active()) return;
     if (s_rf.scanning) return;
     if (cmds_sent || asm_active()) return;   // transfer imminent or in progress
     // Keepalive refresh of a standing off-base grant. The leaf treats ANY packet from
@@ -1381,24 +1558,38 @@ static void maybe_grant_profile(LeafEntry& L, int cmds_sent) {
     if (s_rf.last_switch_ms && millis() - s_rf.last_switch_ms < GW_RF_SWITCH_COOLDOWN_MS)
         return;
     if (s_rf.snr_n < GW_RF_SNR_SAMPLES_MIN) return;
-    const float   snr  = rf_avg_snr();
-    const uint8_t cur  = s_rf.current;
-    uint8_t       want = cur;
+    const float   snr    = rf_avg_snr();
+    const float   rssi   = rf_avg_rssi();
+    // Derate the (strong) uplink reading into a downlink estimate — the grant governs
+    // both directions but only the uplink is measurable from here.
+    const float   dl_est = rssi - GW_RF_DOWNLINK_ASYM_DB;
+    const uint8_t cur    = s_rf.current;
+    uint8_t       want   = cur;
     float         headroom = NAN;
-    if (cur + 1 < LORA_PROFILE_COUNT) {
-        headroom = snr - LORA_PROFILES[cur + 1].snr_floor;
-        if (headroom >= GW_RF_UP_HEADROOM_DB) want = cur + 1;
+    const bool up_blocked = s_rf.up_reverts >= GW_RF_UP_REVERTS_MAX &&
+                            millis() - s_rf.up_revert_ms < GW_RF_UP_BACKOFF_MS;
+    if (cur + 1 < LORA_PROFILE_COUNT && !up_blocked) {
+        const float rssi_hr = dl_est - LORA_PROFILES[cur + 1].rssi_floor;
+        const float snr_hr  = snr    - LORA_PROFILES[cur + 1].snr_floor;
+        if (rssi_hr >= GW_RF_UP_HEADROOM_DB && snr_hr >= GW_RF_UP_HEADROOM_DB) {
+            want = cur + 1;
+            headroom = rssi_hr;
+        }
     }
-    if (want == cur && cur > 0 &&
-        snr - LORA_PROFILES[cur].snr_floor <= GW_RF_DOWN_HEADROOM_DB) {
-        want = cur - 1;
-        headroom = snr - LORA_PROFILES[cur].snr_floor;
+    if (want == cur && cur > 0) {
+        const float rssi_hr = dl_est - LORA_PROFILES[cur].rssi_floor;
+        const float snr_hr  = snr    - LORA_PROFILES[cur].snr_floor;
+        if (rssi_hr <= GW_RF_DOWN_HEADROOM_DB || snr_hr <= GW_RF_DOWN_HEADROOM_DB) {
+            want = cur - 1;
+            headroom = (rssi_hr < snr_hr) ? rssi_hr : snr_hr;   // the binding margin
+        }
     }
     if (want == cur) return;
-    Serial.printf("[gw] ADR: granting %s (snr %.1f, headroom %.1f dB) -> retuning\n",
-                  rf_name(want), snr, headroom);
-    log_event("ADR grant %s (snr %.1f)", rf_name(want), snr);
-    rf_beat("grant", want, snr, headroom);
+    Serial.printf("[gw] ADR: granting %s (rssi %.0f dl_est %.0f snr %.1f, "
+                  "headroom %.1f dB) -> retuning\n",
+                  rf_name(want), rssi, dl_est, snr, headroom);
+    log_event("ADR grant %s (rssi %.0f snr %.1f)", rf_name(want), rssi, snr);
+    rf_beat("grant", want, snr, rssi, headroom);
     rf_send_grant(L.identity, want);
     s_rf.prev           = cur;
     s_rf.pending        = want;
@@ -1486,6 +1677,11 @@ static void announce_wedge_watchdog() {
 
 // Housekeeping outside the announce path: confirm timeouts + the quiet-leaf scan.
 static void rf_loop() {
+    if (s_rf_hold_until && !rf_hold_active()) {
+        s_rf_hold_until = 0;
+        Serial.println("[gw] rf/base: hold expired -> ADR resumed");
+        log_event("rf/base hold expired, ADR resumed");
+    }
     // Scan liveness counts only DIRECT PINNED-LEAF announces (s_rf.last_leaf_ms via
     // rf_note_leaf_heard). It used to count every direct frame so a >90 s in-flight
     // resource chunk wouldn't get the radio retuned from under it (2026-07-03) — but
@@ -1496,7 +1692,19 @@ static void rf_loop() {
         Serial.printf("[gw] ADR: no confirm on %s -> reverting to %s\n",
                       rf_name(s_rf.pending), rf_name(s_rf.prev));
         log_event("ADR revert to %s (no confirm)", rf_name(s_rf.prev));
-        rf_beat("revert", s_rf.prev, NAN, NAN);
+        rf_beat("revert", s_rf.prev, NAN, NAN, NAN);
+        // Up-shift grants ride the weak downlink; a lost one proves nothing changed,
+        // so repeated losses back off further attempts instead of churning (33% of
+        // all historical grants reverted). Down-shift losses are NOT counted — moving
+        // toward robust is the safety direction and must stay eligible every announce.
+        if (s_rf.pending > s_rf.prev) {
+            if (s_rf.up_reverts < 255) s_rf.up_reverts++;
+            s_rf.up_revert_ms = millis();
+            if (s_rf.up_reverts == GW_RF_UP_REVERTS_MAX)
+                log_event("ADR: %u up-shift grants lost -> backoff %lu min",
+                          (unsigned)s_rf.up_reverts,
+                          (unsigned long)(GW_RF_UP_BACKOFF_MS / 60000u));
+        }
         rf_retune(s_rf.prev);
         s_rf.pending = 0xFF;
         rf_clear_snr();
@@ -1999,6 +2207,7 @@ void setup() {
     oled_init();                      // light the parent-facing screen ASAP
 #endif
     RNS::loglevel(RNS::LOG_NOTICE);   // bump to LOG_DEBUG when chasing radio issues
+    RNS::set_log_callback(rns_log_cb);   // mirror NOTICE+ into the /debuglog ring (bug 6)
     Serial.printf("[gw] boot. free heap=%u\n", (unsigned)ESP.getFreeHeap());
 
     // Filesystem: mount existing, format only on the very first boot (identity's stores
@@ -2118,16 +2327,59 @@ void setup() {
     // mounting a new camera; the granted leaf self-reverts within 3 contactless
     // wakes and the site re-converges (multi-leaf: stays on base; single-leaf: ADR
     // simply re-grants once announces resume).
+    // gateway-0.13.0: the park now HOLDS — ADR is suspended for ?min=N minutes
+    // (default GW_RF_BASE_HOLD_DEFAULT_MIN, clamp 1..GW_RF_BASE_HOLD_MAX_MIN) so the
+    // site stays audible on base for the whole enroll/survey window instead of
+    // re-granting up after a few announces. ?min=0 = legacy park, no hold.
     s_web.on("/rf/base", HTTP_POST, []() {
+        long min = GW_RF_BASE_HOLD_DEFAULT_MIN;
+        if (s_web.hasArg("min")) min = s_web.arg("min").toInt();
+        if (min < 0) min = 0;
+        if (min > GW_RF_BASE_HOLD_MAX_MIN) min = GW_RF_BASE_HOLD_MAX_MIN;
         rf_retune(LORA_PROFILE_BASE);
         s_rf.granted  = LORA_PROFILE_BASE;
         s_rf.pending  = 0xFF;
         s_rf.scanning = false;
         rf_persist(LORA_PROFILE_BASE);
         rf_clear_snr();
-        Serial.println("[gw] rf/base: parked on base (operator commissioning)");
-        log_event("operator parked radio on base");
-        s_web.send(200, "text/plain", "radio parked on base\n");
+        s_rf_hold_until = min ? millis() + (uint32_t)min * 60000u : 0;
+        char resp[96];
+        if (min)
+            snprintf(resp, sizeof(resp),
+                     "radio parked on base, ADR held %ld min (POST /rf/resume to release)\n",
+                     min);
+        else
+            snprintf(resp, sizeof(resp), "radio parked on base (no hold)\n");
+        Serial.printf("[gw] rf/base: parked on base, hold %ld min\n", min);
+        log_event("operator parked radio on base (hold %ld min)", min);
+        s_web.send(200, "text/plain", resp);
+    });
+    // Release a survey/commissioning hold early; ADR resumes on the next announces.
+    s_web.on("/rf/resume", HTTP_POST, []() {
+        const bool was = rf_hold_active();
+        s_rf_hold_until = 0;
+        if (was) {
+            Serial.println("[gw] rf/resume: hold released -> ADR resumed");
+            log_event("operator released rf/base hold");
+        }
+        s_web.send(200, "text/plain",
+                   was ? "hold released, ADR resumes\n" : "no hold was active\n");
+    });
+    // Bug-6 diagnosis: dump the RNS/microStore debug ring (see dbglog_push above).
+    s_web.on("/debuglog", []() {
+        String out;
+        out.reserve(DBGLOG_N * (DBGLOG_W / 2));
+        const uint32_t start = (s_dbglog_seq > (uint32_t)DBGLOG_N)
+                                   ? s_dbglog_seq - DBGLOG_N : 0;
+        for (uint32_t i = start; i < s_dbglog_seq; i++) {
+            const uint32_t slot = i % DBGLOG_N;
+            char pre[16];
+            snprintf(pre, sizeof(pre), "%9lu ", (unsigned long)s_dbglog_ms[slot]);
+            out += pre;
+            out += s_dbglog[slot];
+            out += "\n";
+        }
+        s_web.send(200, "text/plain", out);
     });
     // s_web.begin() happens on first network-up in loop(): binding before the
     // interface exists leaves the listener dead (connection refused).

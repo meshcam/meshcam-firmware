@@ -120,3 +120,49 @@ else:
     # The file will exist on the next build; force a second `pio run` in that case.
     print("[patch_microreticulum] %s not present yet (fresh checkout?) — "
           "run pio again after the first build fetches libdeps" % target)
+
+# ---- Patch 4: announce handlers get FRAME-sourced app_data + identity (2026-07-17) ------
+# Upstream hands received_announce() the output of Identity::recall_app_data()/recall()
+# — the known-destinations CACHE — instead of the announce packet's own contents (its
+# author even left a "CBA TODO Why does app data come from recall" note). When the cache
+# misses at runtime, every handler callback starves: empty app_data (no n=/health/ack
+# tails -> command acks never relay) and an invalid identity (downlink can't address the
+# leaf), even though perfectly valid announces keep arriving on the air. Observed live
+# on the two-leaf bench 2026-07-16/17: wire frames carried the full app_data while the
+# gateway logged `announce heard ()` for hours (homelab docs/trailcam/
+# announce-appdata-empty.md). Python RNS parses both from the packet; do the same. The
+# announce signature was already validated over exactly these bytes before dispatch.
+if os.path.isfile(target):
+    with open(target) as f:
+        src = f.read()
+    if "PATCHED (homelab machine-id, 2026-07-17)" in src:
+        print("[patch_microreticulum] frame-sourced announce dispatch already patched")
+    else:
+        ID_OLD = ("\n\t\t\t\t\t\t\t\tIdentity announce_identity(Identity::recall(packet.destination_hash()));\n")
+        ID_NEW = (
+            "\n\t\t\t\t\t\t\t\t// PATCHED (homelab machine-id, 2026-07-17): Python parity — source the\n"
+            "\t\t\t\t\t\t\t\t// handler's identity and app_data from THIS validated announce frame,\n"
+            "\t\t\t\t\t\t\t\t// not the known-destinations cache; cache misses starved handlers with\n"
+            "\t\t\t\t\t\t\t\t// empty app_data + invalid identity while valid announces kept arriving.\n"
+            "\t\t\t\t\t\t\t\tIdentity announce_identity(Identity::recall(packet.destination_hash()));\n"
+            "\t\t\t\t\t\t\t\tif (!announce_identity.pub()) {\n"
+            "\t\t\t\t\t\t\t\t\tIdentity from_packet(false);\n"
+            "\t\t\t\t\t\t\t\t\tfrom_packet.load_public_key(packet.data().left(Type::Identity::KEYSIZE/8));\n"
+            "\t\t\t\t\t\t\t\t\tif (from_packet.pub()) announce_identity = from_packet;\n"
+            "\t\t\t\t\t\t\t\t}\n"
+            "\t\t\t\t\t\t\t\tBytes announce_app_data;\n"
+            "\t\t\t\t\t\t\t\t{\n"
+            "\t\t\t\t\t\t\t\t\tsize_t ad_off = Type::Identity::KEYSIZE/8 + Type::Identity::NAME_HASH_LENGTH/8 +\n"
+            "\t\t\t\t\t\t\t\t\t                Type::Identity::RANDOM_HASH_LENGTH/8 + Type::Identity::SIGLENGTH/8;\n"
+            "\t\t\t\t\t\t\t\t\tif (packet.context_flag() == Type::Packet::FLAG_SET) ad_off += Type::Identity::RATCHETSIZE/8;\n"
+            "\t\t\t\t\t\t\t\t\tif (packet.data().size() > ad_off) announce_app_data = packet.data().mid(ad_off);\n"
+            "\t\t\t\t\t\t\t\t}\n"
+        )
+        AD_OLD = "\n\t\t\t\t\t\t\t\t\t\tIdentity::recall_app_data(packet.destination_hash())\n"
+        AD_NEW = "\n\t\t\t\t\t\t\t\t\t\tannounce_app_data\n"
+        assert src.count(ID_OLD) == 1, "hoisted identity line not found uniquely (%d)" % src.count(ID_OLD)
+        assert src.count(AD_OLD) == 1, "hoisted recall_app_data line not found uniquely (%d)" % src.count(AD_OLD)
+        src = src.replace(ID_OLD, ID_NEW).replace(AD_OLD, AD_NEW)
+        with open(target, "w") as f:
+            f.write(src)
+        print("[patch_microreticulum] frame-sourced announce dispatch patched")

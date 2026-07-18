@@ -28,6 +28,21 @@ public:
 	// liveness only from announces/chunk-completions starved during a long in-flight
 	// resource and retuned the radio mid-transfer (observed 2026-07-03).
 	static uint32_t last_rx_ms;
+	// RNS wire-header peek of the most recent frame (bug 1, 2026-07-16). The origin
+	// transmits hops=0; every transport rebroadcast increments it (and switches to
+	// HEADER_2, which carries a transport-id address field). A transport relay can
+	// deliver a leaf's announces across a radio-profile split, so liveness and ADR
+	// must only trust DIRECT frames — counting relayed ones kept the gateway's
+	// quiet-leaf scan disarmed for 21 h (07-15 outage). Set in on_incoming BEFORE
+	// handle_incoming, so app callbacks fired during inbound dispatch (announce
+	// handlers, resource callbacks) read the values of the frame that fired them.
+	static uint8_t  last_hops;           // hops byte as transmitted (0 = direct)
+	static bool     last_relayed;        // hops > 0 or HEADER_2 (in transport)
+	static uint32_t last_direct_rx_ms;   // millis() of last DIRECT frame (0 = never)
+	// Every ANNOUNCE-type frame demodulated, whether or not Transport's replay/dedup
+	// guards let it reach an announce handler (bug 6 diagnostics: "demodulated every
+	// 26 s but processed once per 112 min" was invisible without this split).
+	static uint32_t announces_seen;
 	// The most recently constructed instance, so app-level ADR code can retune without
 	// threading the pointer through the RNS::Interface wrapper. One radio per node here.
 	static LoRaInterface* active;
@@ -54,6 +69,15 @@ public:
 	uint8_t     profile() const      { return _profile; }
 	const char* profile_name() const { return LORA_PROFILES[_profile].name; }
 	uint16_t    profile_raw_bps() const { return LORA_PROFILES[_profile].raw_bps; }
+
+	// TX power override (leaf TX-power calibration, 2026-07-18). Before start() it
+	// stages the value for begin(); after start() it applies to the live radio
+	// (standby -> setOutputPower -> back to RX). Orthogonal to set_profile(), which
+	// only touches SF/BW/CR — an override sticks across retunes. Range is chip-
+	// enforced: SX126x -9..+22, SX127x PA_BOOST caps at +20; a rejected value
+	// returns false and keeps the previous power.
+	bool set_tx_dbm(int dbm);
+	int  tx_dbm() const { return power; }
 
 	//virtual inline std::string toString() const { return "LoRaInterface[" + name() + "]"; }
 
@@ -90,7 +114,7 @@ private:
 	                                 // front-end). Field/range builds override via
 	                                 // -DLORA_TX_DBM=17..22 (SX127x PA_BOOST caps at 20).
 #endif
-	const int   power     = LORA_TX_DBM;
+	int         power     = LORA_TX_DBM;   // runtime-overridable via set_tx_dbm()
 
 #ifdef ARDUINO
 	Module*        _module      = nullptr;

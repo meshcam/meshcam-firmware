@@ -76,6 +76,10 @@ float LoRaInterface::last_snr  = NAN;
 uint8_t LoRaInterface::last_frame[512];
 size_t  LoRaInterface::last_frame_len = 0;
 uint32_t LoRaInterface::last_rx_ms = 0;
+uint8_t  LoRaInterface::last_hops = 0;
+bool     LoRaInterface::last_relayed = false;
+uint32_t LoRaInterface::last_direct_rx_ms = 0;
+uint32_t LoRaInterface::announces_seen = 0;
 LoRaInterface* LoRaInterface::active = nullptr;
 
 static inline bool    isSplitPacket(uint8_t h)  { return (h & LoRaInterface::HEADER_SPLIT)   != 0; }
@@ -148,6 +152,35 @@ bool LoRaInterface::set_profile(uint8_t idx) {
 		      (unsigned)idx, p.name, (unsigned)p.raw_bps);
 	}
 #endif
+	return true;
+}
+
+// Runtime TX power. Same live-retune shape as set_profile(): standby, poke the
+// chip, re-arm RX. Pre-start it only stages `power` for begin(). On a rejected
+// value the radio is re-armed on its previous power and we return false.
+bool LoRaInterface::set_tx_dbm(int dbm) {
+#ifdef ARDUINO
+	if (_online) {
+		int st;
+		if (_sx126x) {
+			_sx126x->standby();
+			st = _sx126x->setOutputPower(dbm);
+		} else if (_sx127x) {
+			_sx127x->standby();
+			st = _sx127x->setOutputPower(dbm);
+		} else {
+			ERROR("LoRaInterface: runtime TX power unsupported on this chip");
+			return false;
+		}
+		_radio->startReceive();
+		if (st != RADIOLIB_ERR_NONE) {
+			ERRORF("LoRaInterface: setOutputPower(%d) rejected (%d)", dbm, st);
+			return false;
+		}
+		INFOF("LoRaInterface: TX power now %d dBm", dbm);
+	}
+#endif
+	power = dbm;
 	return true;
 }
 
@@ -424,6 +457,16 @@ void LoRaInterface::loop() {
 	DEBUGF("%s.on_incoming: data: %s", toString().c_str(), data.toHex().c_str());
 	last_frame_len = std::min(data.size(), sizeof(last_frame));
 	memcpy(last_frame, data.data(), last_frame_len);
+	// Peek the RNS wire header (bug 1): byte 0 bit 6 = header type (1 = HEADER_2,
+	// in transport), bits 1:0 = packet type (0b01 = ANNOUNCE); byte 1 = hops as
+	// transmitted. See the header-file comment for why app code needs this split.
+	if (data.size() >= 2) {
+		const uint8_t flags = data.data()[0];
+		last_hops    = data.data()[1];
+		last_relayed = (flags & 0x40) != 0 || last_hops > 0;
+		if (!last_relayed) last_direct_rx_ms = millis();
+		if ((flags & 0x03) == 0x01) announces_seen++;
+	}
 	// Pass received data on to transport
 	InterfaceImpl::handle_incoming(data);
 }

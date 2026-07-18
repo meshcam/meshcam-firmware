@@ -155,6 +155,35 @@ bool LoRaInterface::set_profile(uint8_t idx) {
 	return true;
 }
 
+// Runtime TX power. Same live-retune shape as set_profile(): standby, poke the
+// chip, re-arm RX. Pre-start it only stages `power` for begin(). On a rejected
+// value the radio is re-armed on its previous power and we return false.
+bool LoRaInterface::set_tx_dbm(int dbm) {
+#ifdef ARDUINO
+	if (_online) {
+		int st;
+		if (_sx126x) {
+			_sx126x->standby();
+			st = _sx126x->setOutputPower(dbm);
+		} else if (_sx127x) {
+			_sx127x->standby();
+			st = _sx127x->setOutputPower(dbm);
+		} else {
+			ERROR("LoRaInterface: runtime TX power unsupported on this chip");
+			return false;
+		}
+		_radio->startReceive();
+		if (st != RADIOLIB_ERR_NONE) {
+			ERRORF("LoRaInterface: setOutputPower(%d) rejected (%d)", dbm, st);
+			return false;
+		}
+		INFOF("LoRaInterface: TX power now %d dBm", dbm);
+	}
+#endif
+	power = dbm;
+	return true;
+}
+
 /*virtual*/ LoRaInterface::~LoRaInterface() {
 	if (active == this) active = nullptr;
 	stop();

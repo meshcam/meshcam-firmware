@@ -68,6 +68,13 @@ bool leaf_radio_send_full(const uint8_t* buf, size_t len, const char* event_id,
 bool leaf_radio_set_profile(uint8_t idx);
 const char* leaf_radio_profile_name();
 
+// TX power (tx-power calibration, 2026-07-18): override the compile-time
+// LORA_TX_DBM at runtime. Stage-or-live like set_profile(). The value in use is
+// reported in every announce tail as "tx=<dbm>" so gateway-side telemetry
+// self-describes which power each checkin was sent at.
+bool leaf_radio_set_tx_dbm(int dbm);
+int  leaf_radio_tx_dbm();
+
 // True once THIS wake saw any proof the gateway can hear us (a link came up, or a mesh
 // command/packet arrived). The ADR revert logic counts wakes without contact: N silent
 // wakes on a non-base profile means the profiles may have diverged -> fall back to base.

@@ -70,6 +70,15 @@ public:
 	const char* profile_name() const { return LORA_PROFILES[_profile].name; }
 	uint16_t    profile_raw_bps() const { return LORA_PROFILES[_profile].raw_bps; }
 
+	// TX power override (leaf TX-power calibration, 2026-07-18). Before start() it
+	// stages the value for begin(); after start() it applies to the live radio
+	// (standby -> setOutputPower -> back to RX). Orthogonal to set_profile(), which
+	// only touches SF/BW/CR — an override sticks across retunes. Range is chip-
+	// enforced: SX126x -9..+22, SX127x PA_BOOST caps at +20; a rejected value
+	// returns false and keeps the previous power.
+	bool set_tx_dbm(int dbm);
+	int  tx_dbm() const { return power; }
+
 	//virtual inline std::string toString() const { return "LoRaInterface[" + name() + "]"; }
 
 private:
@@ -105,7 +114,7 @@ private:
 	                                 // front-end). Field/range builds override via
 	                                 // -DLORA_TX_DBM=17..22 (SX127x PA_BOOST caps at 20).
 #endif
-	const int   power     = LORA_TX_DBM;
+	int         power     = LORA_TX_DBM;   // runtime-overridable via set_tx_dbm()
 
 #ifdef ARDUINO
 	Module*        _module      = nullptr;

@@ -265,6 +265,22 @@ static void rf_profile_wake_begin() {
                   leaf_radio_profile_name(), (unsigned)g_rf_silent_wakes,
                   (unsigned)LEAF_RF_SILENT_WAKES_MAX);
 }
+
+#ifdef LEAF_TX_SWEEP
+// TX-power sweep (calibration, 2026-07-18): cycle output power across wakes so one
+// soak maps gateway-side RSSI vs TX dBm with the levels interleaved — slow fading
+// hits every level equally instead of biasing whichever ran last. The announce tail's
+// "tx=<dbm>" makes each checkin self-describing in telemetry. Bench flag only; field
+// builds pin one power via -DLORA_TX_DBM.
+RTC_DATA_ATTR uint8_t g_tx_sweep_idx = 0;
+static void tx_sweep_wake_begin() {
+    static const int SWEEP[] = {10, 14, 17, 20, 22};
+    const int dbm = SWEEP[g_tx_sweep_idx % (sizeof(SWEEP) / sizeof(SWEEP[0]))];
+    g_tx_sweep_idx++;
+    leaf_radio_set_tx_dbm(dbm);   // pre-begin: stages for radio init
+    Serial.printf("[leaf] TX sweep: %d dBm this wake\n", dbm);
+}
+#endif
 #endif
 
 static void on_gateway_command(const char* kind, const char* event_id, const char* quality) {
@@ -622,6 +638,54 @@ static void wait_pir_low() {
     while (digitalRead((int)PIR_GPIO) == HIGH && millis() - t0 < 6000) delay(20);
 }
 
+// --- over-discharge lockout (leaf-0.16.0) --------------------------------------------
+// The CN3058E guards the cell while CHARGING (3.6 V CV, C/10 term); nothing on the
+// board guards it from US — protected 1S LiFePO4 26650s effectively don't exist
+// (homelab docs/trailcam/leaf-pcb.md, 2026-07-03) and there is no protection PCB. So
+// the discharge cutoff is firmware: below LOCKOUT every wake collapses to "read ADC,
+// sleep an hour" — no radio, no camera, no ext0 (a busy game trail must not burn
+// boots on a flat cell) — until solar lifts the cell past RESUME. The deep-sleep
+// floor (~tens of uA incl. the 940 k divider + PIR) parks a 26650 for years, so
+// refusing the SPENDING is as good as a hardware disconnect. What firmware can't
+// stop is a brownout boot loop — hence the last-gasp announce is skipped after a
+// BROWNOUT reset, and a real UVLO stays on the next-spin wishlist.
+// Hysteresis is wide on purpose: the LiFePO4 curve sits flat near 3.2 V for most of
+// capacity, so a narrow band would chatter on ADC noise; 3.30 V is only reachable
+// by actual charging. Reads are unloaded by construction — the FET rails are still
+// held off this early in boot.
+#ifndef LEAF_VBAT_LOCKOUT_V
+#define LEAF_VBAT_LOCKOUT_V 3.00f      // resting ~5-10% SoC on LiFePO4
+#endif
+#ifndef LEAF_VBAT_RESUME_V
+#define LEAF_VBAT_RESUME_V  3.30f      // unreachable except by charging
+#endif
+#ifndef LEAF_VBAT_SENSE_FLOOR_V
+#define LEAF_VBAT_SENSE_FLOOR_V 2.00f  // the LDO can't be running the MCU from less:
+#endif                                 // a lower reading means the SENSE is broken
+#ifndef LEAF_LOCKOUT_SLEEP_S
+#define LEAF_LOCKOUT_SLEEP_S 3600
+#endif
+RTC_DATA_ATTR uint8_t g_lowbatt = 0;   // wiped by cold boot -> re-evaluated from the ADC
+
+static float read_vbat_avg() {         // 8-sample mean (~1 ms): kills single-read jitter
+    float sum = 0; int n = 0;
+    for (int i = 0; i < 8; i++) {
+        float v = leaf_read_vbat();
+        if (!isnan(v)) { sum += v; n++; }
+    }
+    return n ? sum / (float)n : NAN;
+}
+
+[[noreturn]] static void lowbatt_sleep(float vb) {
+    leaf_rails_all_off();
+    Serial.printf("[leaf] LOW BATTERY %.2fV -> lockout: timer-only sleep %us (resume >= %.2fV)\n",
+                  vb, (unsigned)LEAF_LOCKOUT_SLEEP_S, LEAF_VBAT_RESUME_V);
+    Serial.flush();
+    g_last_sleep_s = LEAF_LOCKOUT_SLEEP_S;
+    esp_sleep_enable_timer_wakeup((uint64_t)LEAF_LOCKOUT_SLEEP_S * 1000000ULL);
+    esp_deep_sleep_start();
+}
+
 static void arm_and_sleep() {
     // time-of-day for the schedule (approx; corrected by gateway sync later)
     bool time_known = (g_unixtime > 0);
@@ -746,7 +810,45 @@ void setup() {
     // ADR: stage the granted (or reverted) radio profile BEFORE any radio use — a PIR
     // wake's thumb push is the first TX and must already be on the negotiated profile.
     rf_profile_wake_begin();
+#ifdef LEAF_TX_SWEEP
+    tx_sweep_wake_begin();   // before any radio use, so the announce TXes at it too
 #endif
+#endif
+
+    // Over-discharge lockout gate (see the block above arm_and_sleep). After the clock
+    // block (the approx clock must keep ticking through a long lockout) and before the
+    // dispatch — a lockout wake does NONE of the normal work.
+    {
+        const float vb    = read_vbat_avg();
+        const bool  vb_ok = !isnan(vb) && vb >= LEAF_VBAT_SENSE_FLOOR_V;
+        if (g_lowbatt) {
+            if (vb_ok && vb < LEAF_VBAT_RESUME_V) {
+                // Still low. Unsynced-clock fallback advance (mirrors the TIMER case
+                // below, which we never reach), then straight back down.
+                if (!rtc_clock_valid && g_unixtime > 0 && cause == ESP_SLEEP_WAKEUP_TIMER)
+                    g_unixtime += g_last_sleep_s;
+                lowbatt_sleep(vb);
+            }
+            // Recovered — or the sense went bogus, in which case run rather than brick:
+            // a dark camera until a site visit costs more than the cell it protects.
+            g_lowbatt = 0;
+            Serial.printf("[leaf] battery lockout cleared (vb=%.2fV) -> normal duty\n", vb);
+        } else if (vb_ok && vb < LEAF_VBAT_LOCKOUT_V) {
+            g_lowbatt = 1;
+            // Last gasp: one announce so the dashboard shows WHY this node goes dark
+            // (vb rides the health tail; a node that vanished at vb=2.98 is a different
+            // debug session than one that vanished at 3.5). Never after a BROWNOUT
+            // reset — TX sag is the prime brownout suspect at this voltage and
+            // retrying it every boot is the loop that kills cells.
+#ifdef LEAF_RADIO
+            if (esp_reset_reason() != ESP_RST_BROWNOUT && leaf_radio_begin()) {
+                leaf_radio_set_health(g_pir_wakes, g_captures, g_push_fails, vb);
+                leaf_radio_announce("lowbatt");
+            }
+#endif
+            lowbatt_sleep(vb);
+        }
+    }
 
     switch (cause) {
         case ESP_SLEEP_WAKEUP_EXT0:  g_pir_wakes++;   on_pir_event();        break;

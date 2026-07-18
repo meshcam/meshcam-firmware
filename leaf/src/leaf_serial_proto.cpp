@@ -15,7 +15,7 @@
 #define LEAF_NODE_SLUG ""
 #endif
 #ifndef LEAF_FW_VERSION
-#define LEAF_FW_VERSION "leaf-0.15.1"
+#define LEAF_FW_VERSION "leaf-0.17.0"
 #endif
 
 // RTC-persisted: PIR wakes mint event ids and emit the serial EVT BEFORE the radio comes
@@ -277,6 +277,14 @@ void tc_poll_commands(uint32_t window_ms, tc_cmd_handler handler) {
         }
         line[n] = '\0';
         if (n >= 8 && strncmp(line, "!TC CMD ", 8) == 0) {
+            // Receipt ack, serial channel: mirror the mesh path's "a=<id>" announce
+            // tail. Emit BEFORE the handler runs (receipt is not completion, and a
+            // fetch_full handler can hold the wake for minutes); the bridge relays it
+            // to POST /commands/<id>/ack. Bridge-relayed server commands always carry
+            // an id; lines without one (hand-typed test commands) just get no ack.
+            uint32_t cmd_id = 0;
+            if (json_u32(line + 8, "id", &cmd_id))
+                Serial.printf("!TC ACK %lu\n", (unsigned long)cmd_id);
             tc_handle_cmd_json(line + 8, handler);
             // The bridge delivers its whole queue as a burst, and a slow handler (live
             // capture ~5 s) would otherwise eat the window before the next line is read.

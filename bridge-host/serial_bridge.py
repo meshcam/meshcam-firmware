@@ -169,6 +169,25 @@ class Uploader:
             stop.wait(backoff)
             backoff = min(backoff * 2, 60)
 
+    def ack_command(self, cmd_id: int) -> None:
+        """Relay a leaf `!TC ACK <id>` receipt: flips the command delivered ->
+        received server-side (stops redelivery; receipt is not completion — the
+        same contract as the gateway relaying the mesh path's a=<id> announce).
+        Fire-and-forget: a lost ack just means the server re-delivers and the
+        leaf re-acks on the next window."""
+        try:
+            r = self.http.post(
+                f"{self.commands_url}/{cmd_id}/ack",
+                json={"status": "received", "detail": "leaf ack via serial"},
+                timeout=15,
+            )
+            if r.ok:
+                log.info("command %d receipt-acked", cmd_id)
+            else:
+                log.warning("command %d ack -> %d %s", cmd_id, r.status_code, r.text[:120])
+        except requests.RequestException as exc:
+            log.warning("command %d ack failed (server redelivery covers it): %s", cmd_id, exc)
+
     def post_telemetry(self, beat: dict) -> None:
         beat.setdefault("site", self.default_site)
         try:
@@ -214,6 +233,11 @@ class FrameParser:
                 log.error("bad EVT header: %s (%s)", line[8:120], exc)
         elif line.startswith("!TC END "):
             self._finish(line[8:])
+        elif line.startswith("!TC ACK "):
+            try:
+                self.up.ack_command(int(line[8:].split()[0]))
+            except (ValueError, IndexError):
+                log.error("bad ACK line: %s", line[:80])
         elif self.header is not None and line and not line.startswith("!TC"):
             self.b64.append(line.strip())
         elif line:
