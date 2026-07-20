@@ -52,7 +52,7 @@
 #define GW_SITE "home"
 #endif
 #ifndef GW_FW_VERSION
-#define GW_FW_VERSION "gateway-0.14.0"
+#define GW_FW_VERSION "gateway-0.14.4"
 #endif
 #ifndef GW_VIEW_HOST
 #define GW_VIEW_HOST "trailcam.example.com"   // family gallery shown on the OLED
@@ -643,11 +643,21 @@ static bool have_check(const char* eid, const char* kind) {
     return false;
 }
 
+// Custody REVOKED: a queued upload we dropped never reached the server, and a ring
+// that still claims it would make the leaf dedup-skip every server retry — the photo
+// would be lost with all three ends convinced someone else had it (0.14.3).
+static void have_unnote(const char* eid, const char* kind) {
+    for (int i = 0; i < GW_HAVE_RING; i++)
+        if (strcmp(s_have[i].event_id, eid) == 0 && strcmp(s_have[i].kind, kind) == 0)
+            s_have[i].event_id[0] = 0;
+}
+
 // Take ownership of a bare-JPEG buffer + metadata (zero-copy for thumbs).
 static void queue_upload_owned(uint8_t* jpeg, size_t len, const char* eid,
                                const char* cam, const char* kind, long long capts) {
     if (s_pending.jpeg || s_pending.spooled) {
         Serial.println("[gw] upload queue full -> DROPPING the older pending frame");
+        have_unnote(s_pending.event_id, s_pending.kind);
         pending_clear();
     }
     s_pending.jpeg = jpeg;
@@ -666,6 +676,7 @@ static void queue_upload_spooled(size_t len, const char* eid,
                                  const char* cam, long long capts) {
     if (s_pending.jpeg || s_pending.spooled) {
         Serial.println("[gw] upload queue full -> DROPPING the older pending frame");
+        have_unnote(s_pending.event_id, s_pending.kind);
         pending_clear();
     }
     s_pending.spooled = true;
@@ -924,8 +935,12 @@ static void on_resource_concluded(const RNS::Resource& resource) {
 }
 
 // "have?" query arriving as a small packet over the link (see the dedup block above).
-// Reply goes back over the same link — this gateway services one leaf link at a time,
-// and latest_link IS the link this packet arrived on.
+// The reply is STAGED for loop(), never sent from here: this callback runs inside
+// inbound dispatch, and TX from dispatch context is the exact re-entrancy the
+// microReticulum outbound/inbound patch exists for — the send gets eaten (verified
+// on air 2026-07-18: leaf logged "have? no reply" twice while the ring had the
+// event). Same defer-to-loop() pattern as the probe_ack.
+static char s_have_reply_out[160] = "";
 static void on_link_packet(const RNS::Bytes& plaintext, const RNS::Packet& /*packet*/) {
     char q[16] = "", eid[48] = "", kind[8] = "";
     std::string js((const char*)plaintext.data(),
@@ -943,16 +958,14 @@ static void on_link_packet(const RNS::Bytes& plaintext, const RNS::Packet& /*pac
         mask   = s_asm.got_mask;
         chunks = s_asm.chunks;
     }
-    char reply[160];
-    snprintf(reply, sizeof(reply),
+    snprintf(s_have_reply_out, sizeof(s_have_reply_out),
              "{\"a\":\"have\",\"event_id\":\"%s\",\"kind\":\"%s\","
              "\"complete\":%d,\"got_mask\":%lu,\"chunks\":%u}",
              eid, kind, complete ? 1 : 0, (unsigned long)mask, chunks);
-    RNS::Packet(latest_link, RNS::Bytes((const uint8_t*)reply, strlen(reply))).send();
-    Serial.printf("[gw] have? %s %s -> %s%s\n", eid, kind,
+    Serial.printf("[gw] have? %s %s -> %s%s (reply staged)\n", eid, kind,
                   complete ? "COMPLETE (dedup save)" : "miss",
-                  mask ? " (partial mask sent)" : "");
-    if (complete) log_event("dedup: %s %s already held, re-send skipped", eid, kind);
+                  mask ? " (partial mask)" : "");
+    log_event("have? %.12s %s -> %s", eid, kind, complete ? "HIT (dedup)" : "miss");
 }
 
 static void on_link_established(RNS::Link& link) {
@@ -2389,6 +2402,20 @@ void setup() {
 
 void loop() {
     reticulum.loop();
+
+    // Staged "have?" reply — IMMEDIATELY after the radio pump, before any WiFi/HTTP
+    // work. First placement (bottom of loop) verified failed on air 2026-07-18: the
+    // beat flush's TLS POST sat between dispatch and the send, the reply left ~5 s
+    // late, missed the leaf's wait window, and the late TX collided with the leaf's
+    // fail-open chunk 1. Radio replies outrank telemetry.
+    if (s_have_reply_out[0] && latest_link) {
+        RNS::Packet pkt(latest_link, RNS::Bytes((const uint8_t*)s_have_reply_out,
+                                                strlen(s_have_reply_out)));
+        pkt.send();
+        Serial.printf("[gw] have? reply delivered: %s\n", s_have_reply_out);
+        s_have_reply_out[0] = 0;
+    }
+
     s_web.handleClient();
     ArduinoOTA.handle();
 

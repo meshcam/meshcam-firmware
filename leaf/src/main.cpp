@@ -156,6 +156,7 @@ static uint8_t* resolve_full_bytes(const char* event_id, const char* quality,
     if (!buf) {
         Serial.printf("[leaf] fetch_full %s: not in store -> ignored (expires server-side)\n",
                       event_id);
+        leaf_store_debug_list("fetch-miss");
         return nullptr;
     }
     if (out_capts) *out_capts = mtime > 0 ? mtime : g_unixtime;
@@ -414,8 +415,11 @@ static void on_pir_event() {
             g_push_fails++;             // health counter (bug 5): push failed
 
         // Store the same-moment full-res, keyed by event_id — it only travels when a
-        // fetch_full command asks for it.
+        // fetch_full command asks for it. A missing full grab must SAY so — a silent
+        // skip here is indistinguishable from store loss at fetch_full time.
         if (fullbuf && fulllen) leaf_store_save(eid, fullbuf, fulllen);
+        else Serial.printf("[leaf] full grab EMPTY for %s -> nothing stored "
+                           "(fetch_full will miss)\n", eid);
     }
 
     if (fullbuf) heap_caps_free(fullbuf);
@@ -444,6 +448,10 @@ static void on_scheduled_checkin() {
 // First boot / reset: full init + announce our (persistent) identity to the mesh so the
 // gateway learns our path.
 static void on_cold_boot() {
+    // One store listing per power cycle: shows on the console whether earlier
+    // sessions' fulls actually persisted (2026-07-18 saves were vanishing by the
+    // next wake). Cold boot only — never per-wake (SD mount costs battery).
+    leaf_store_debug_list("cold-boot");
 #ifdef LEAF_RADIO
     if (leaf_radio_begin()) {
         leaf_radio_set_health(g_pir_wakes, g_captures, g_push_fails, leaf_read_vbat());

@@ -25,3 +25,7 @@ bool leaf_store_save(const char* event_id, const uint8_t* buf, size_t len);
 // Load a stored full-res into a PSRAM buffer (caller frees with heap_caps_free).
 // Returns nullptr if not stored. mtime_out (optional) = file mtime, ~the capture time.
 uint8_t* leaf_store_load(const char* event_id, size_t* len_out, int64_t* mtime_out);
+
+// Print the store directory (first few entries + count/bytes/backend) tagged with
+// `why`. Fetch-miss forensics: three 2026-07-18 fetch_fulls found saves gone.
+void leaf_store_debug_list(const char* why);

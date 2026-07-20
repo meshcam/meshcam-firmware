@@ -324,7 +324,11 @@ static bool query_gateway_have(const char* eid, const char* kind,
                      "{\"q\":\"have\",\"event_id\":\"%s\",\"kind\":\"%s\"}", eid, kind);
     s_have_reply = false;
     RNS::Packet(s_gw_link, RNS::Bytes((const uint8_t*)q, (size_t)n)).send();
-    if (!pump_until(&s_have_reply, 4000)) {
+    // 8 s, not 4 (2026-07-18 air test): the gateway can be inside a blocking TLS
+    // beat-POST when the query lands, and its staged reply waits that POST out.
+    // Only a live-gateway path ever waits here (the link just established), so the
+    // cap is the pathological ceiling, not the typical cost (~1 s).
+    if (!pump_until(&s_have_reply, 8000)) {
         Serial.println("[radio] have? no reply -> fail-open send");
         return false;
     }

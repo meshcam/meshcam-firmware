@@ -29,7 +29,14 @@
 #define LEAF_SD_D0  40
 #endif
 
-static const char* DIR = "/tcfull";
+// /tcfull2, not /tcfull (2026-07-18): the original directory's FAT chain is damaged
+// on the office leaf's card — 1247 ancient files (July-2 era, led by a 0-byte scar
+// from an interrupted write) list forever, while every NEW save verifies in-session
+// and is GONE on remount (three fetch_fulls proved it). Entries appended past the
+// break land in an orphaned cluster the directory cache shows but the on-card chain
+// doesn't. A fresh directory = a fresh, intact chain. The old dir stays untouched
+// for fsck/postmortem at next physical access; reformat the card when convenient.
+static const char* DIR = "/tcfull2";
 
 static fs::FS* s_fs      = nullptr;   // active backend (SD_MMC or LittleFS)
 static bool    s_on_sd   = false;
@@ -113,9 +120,44 @@ bool leaf_store_save(const char* event_id, const uint8_t* buf, size_t len) {
         s_fs->remove(path);
         return false;
     }
-    Serial.printf("[store] saved %s (%u bytes, %s)\n", path, (unsigned)len,
+    // Post-save read-back (2026-07-18): three straight fetch_fulls hit "not in
+    // store" for events whose save had logged success on SD — something between
+    // f.close() and a later wake loses the file. Same philosophy as the gateway's
+    // spool stat-verify: never trust a quiet write. This catches a card that acks
+    // writes it didn't commit at the moment it lies, not 30 wakes later.
+    File v = s_fs->open(path, "r");
+    const size_t vsz = v ? v.size() : 0;
+    if (v) v.close();
+    if (vsz != len) {
+        Serial.printf("[store] POST-SAVE VERIFY FAILED %s (read %u != wrote %u)\n",
+                      path, (unsigned)vsz, (unsigned)len);
+        return false;
+    }
+    Serial.printf("[store] saved %s (%u bytes, %s, verified)\n", path, (unsigned)len,
                   s_on_sd ? "SD" : "LittleFS");
     return true;
+}
+
+// Diagnostic listing for fetch-miss forensics: what IS in the store, on which
+// backend. Turns every "not in store" into a diagnosis instead of a mystery.
+void leaf_store_debug_list(const char* why) {
+    if (!leaf_store_begin()) return;
+    File d = s_fs->open(DIR);
+    if (!d || !d.isDirectory()) {
+        Serial.printf("[store] list(%s): %s won't open on %s\n", why, DIR,
+                      s_on_sd ? "SD" : "LittleFS");
+        return;
+    }
+    int n = 0;
+    size_t bytes = 0;
+    for (File f = d.openNextFile(); f; f = d.openNextFile()) {
+        n++;
+        bytes += f.size();
+        if (n <= 8) Serial.printf("[store]   %s (%u B)\n", f.path(), (unsigned)f.size());
+    }
+    d.close();
+    Serial.printf("[store] list(%s): %d file(s), %u B, backend=%s\n",
+                  why, n, (unsigned)bytes, s_on_sd ? "SD" : "LittleFS");
 }
 
 uint8_t* leaf_store_load(const char* event_id, size_t* len_out, int64_t* mtime_out) {
