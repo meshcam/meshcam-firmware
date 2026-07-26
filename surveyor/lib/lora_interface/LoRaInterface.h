@@ -79,6 +79,17 @@ public:
 	bool set_tx_dbm(int dbm);
 	int  tx_dbm() const { return power; }
 
+	// --- Radio test mode (gateway cert bench) — NOT used in normal operation.
+	// Repurpose the live radio for the continuous emissions a §15.247 DTS lab measures:
+	// radio_test_cw() = unmodulated carrier (SetTxContinuousWave); radio_test_mod() =
+	// modulated continuous (SetTxInfinitePreamble, i.e. a continuous LoRa chirp = the
+	// DTS 6 dB bandwidth). SX126x only (false on SX127x / radio-absent boards).
+	// radio_test_stop() fully restores normal RX on the current profile. WiFi/ethernet/
+	// OTA are untouched, so the node stays reachable and OTA-recoverable throughout.
+	bool radio_test_cw(float freq_mhz, int8_t dbm);
+	bool radio_test_mod(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr, int8_t dbm);
+	void radio_test_stop();
+
 	//virtual inline std::string toString() const { return "LoRaInterface[" + name() + "]"; }
 
 private:

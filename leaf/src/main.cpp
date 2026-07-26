@@ -673,6 +673,9 @@ static void wait_pir_low() {
 #ifndef LEAF_LOCKOUT_SLEEP_S
 #define LEAF_LOCKOUT_SLEEP_S 3600
 #endif
+#ifndef LEAF_BROWNOUT_BACKOFF_S
+#define LEAF_BROWNOUT_BACKOFF_S 900    // 15 min: let the rail settle after a brownout reset
+#endif
 RTC_DATA_ATTR uint8_t g_lowbatt = 0;   // wiped by cold boot -> re-evaluated from the ADC
 
 static float read_vbat_avg() {         // 8-sample mean (~1 ms): kills single-read jitter
@@ -691,6 +694,30 @@ static float read_vbat_avg() {         // 8-sample mean (~1 ms): kills single-re
     Serial.flush();
     g_last_sleep_s = LEAF_LOCKOUT_SLEEP_S;
     esp_sleep_enable_timer_wakeup((uint64_t)LEAF_LOCKOUT_SLEEP_S * 1000000ULL);
+    esp_deep_sleep_start();
+}
+
+// Brownout backoff (2026-07-19 c4-pcb root cause, see leaf-pcb-bringup.md 3c).
+// A brownout reset means the rail collapsed under a current pulse — a TX burst
+// (~120 mA) or camera init — through a marginal battery-path contact, NOT an empty
+// cell (LiFePO4 rests flat at 3.2-3.3 V, so a brownout up there is a contact/impedance
+// problem; a genuinely flat cell is caught by the lowbatt lockout above). Charging
+// straight back into on_cold_boot() -> radio -> TX just sags the rail again: a reset
+// loop that hammers the cell and re-mounts the SD every few seconds. Break it by
+// napping with every peripheral rail off and letting the rail recover. Deliberately
+// STATELESS (no brownout counter): RTC RAM is not trustworthy across a brownout,
+// whereas esp_reset_reason() reads a latched hardware register that is — so one
+// brownout maps to one nap, robustly. A genuine one-off transient costs a single
+// delayed check-in; a marginal board degrades to quiet naps instead of TX-thrashing a
+// sagging rail. It is graceful degradation, not a repair: the marginal contact still
+// needs a solder fix at J7 (bring-up 3b).
+[[noreturn]] static void brownout_backoff_sleep() {
+    leaf_rails_all_off();
+    Serial.printf("[leaf] BROWNOUT reset -> backoff: no peripherals, timer sleep %us\n",
+                  (unsigned)LEAF_BROWNOUT_BACKOFF_S);
+    Serial.flush();
+    g_last_sleep_s = LEAF_BROWNOUT_BACKOFF_S;
+    esp_sleep_enable_timer_wakeup((uint64_t)LEAF_BROWNOUT_BACKOFF_S * 1000000ULL);
     esp_deep_sleep_start();
 }
 
@@ -794,6 +821,11 @@ void setup() {
     g_boot_count++;
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     print_status(cause);
+
+    // Brownout backoff FIRST — before the OTA flash write, radio-profile staging, and any
+    // rail. A rail that collapsed last boot must settle, not take another current pulse
+    // (or a flash write). Stateless by design; see brownout_backoff_sleep() for the why.
+    if (esp_reset_reason() == ESP_RST_BROWNOUT) brownout_backoff_sleep();
 
     // Pin the bootloader to THIS slot. Observed 2026-07-03: the board alternated between
     // leaf-0.5.0 and leaf-0.7.0 across ordinary deep-sleep wakes (wake #708-711 vs #712,

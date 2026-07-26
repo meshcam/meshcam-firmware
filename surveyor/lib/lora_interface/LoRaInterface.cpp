@@ -184,6 +184,59 @@ bool LoRaInterface::set_tx_dbm(int dbm) {
 	return true;
 }
 
+// --- Radio test mode (gateway cert bench) -----------------------------------------------
+// Repurpose the live radio for a continuous emission the way a §15.247 DTS lab drives it.
+// SX126x only (the die we certify); a no-op returning false on SX127x / radio-absent
+// boards. These do NOT touch WiFi/ethernet/OTA, so the node stays reachable and
+// OTA-recoverable the whole time — radio_test_stop() (or the caller's timeout) restores
+// normal RX on the current profile. DIO2-as-RF-switch (set in start()) keys TXEN when the
+// chip enters TX, so the emission reaches the antenna. OCP is raised to 140 mA so +22 dBm
+// isn't silently clamped (RadioLib's 60 mA default); left raised on restore (an upper
+// limit only, harmless for normal ops).
+#ifdef ARDUINO
+bool LoRaInterface::radio_test_cw(float freq_mhz, int8_t dbm) {
+	if (!_sx126x) return false;
+	_sx126x->standby();
+	_sx126x->setFrequency(freq_mhz);
+	_sx126x->setCurrentLimit(140.0);
+	_sx126x->setOutputPower(dbm);
+	int st = _sx126x->transmitDirect();   // SetTxContinuousWave (unmodulated carrier)
+	INFOF("LoRaInterface: TEST CW %.3f MHz @ %d dBm (st %d)", freq_mhz, (int)dbm, st);
+	return st == RADIOLIB_ERR_NONE;
+}
+
+bool LoRaInterface::radio_test_mod(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr, int8_t dbm) {
+	if (!_sx126x) return false;
+	_sx126x->standby();
+	_sx126x->setFrequency(freq_mhz);
+	_sx126x->setBandwidth(bw_khz);
+	_sx126x->setSpreadingFactor(sf);
+	_sx126x->setCodingRate(cr);
+	_sx126x->setCurrentLimit(140.0);
+	_sx126x->setOutputPower(dbm);
+	// No public RadioLib wrapper for infinite preamble; issue the raw command on the
+	// Module we own (the same path transmitDirect() takes internally for CW). Continuous
+	// LoRa chirp = the DTS 6 dB occupied bandwidth the lab measures.
+	int st = _module->SPIwriteStream(RADIOLIB_SX126X_CMD_SET_TX_INFINITE_PREAMBLE, NULL, 0);
+	INFOF("LoRaInterface: TEST MOD %.3f MHz BW %.0f SF%u @ %d dBm (st %d)",
+	      freq_mhz, bw_khz, (unsigned)sf, (int)dbm, st);
+	return st == RADIOLIB_ERR_NONE;
+}
+
+void LoRaInterface::radio_test_stop() {
+	if (!_sx126x) return;
+	_sx126x->standby();
+	_sx126x->setFrequency(frequency);    // back to the fixed operating channel (915)
+	_sx126x->setOutputPower(power);      // back to the normal runtime TX power
+	set_profile(_profile);               // reconfigure SF/BW/CR for the current profile + startReceive()
+	INFO("LoRaInterface: TEST stopped -> normal RX restored");
+}
+#else
+bool LoRaInterface::radio_test_cw(float, int8_t) { return false; }
+bool LoRaInterface::radio_test_mod(float, float, uint8_t, uint8_t, int8_t) { return false; }
+void LoRaInterface::radio_test_stop() {}
+#endif
+
 /*virtual*/ LoRaInterface::~LoRaInterface() {
 	if (active == this) active = nullptr;
 	stop();

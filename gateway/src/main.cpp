@@ -383,6 +383,18 @@ static bool rf_hold_active() {
     return s_rf_hold_until && (int32_t)(s_rf_hold_until - millis()) > 0;
 }
 
+// --- Radio test mode -----------------------------------------------------------------
+// Reversible cert-bench emission, driven over the local web server (POST /rf/test).
+// Transient RAM state layered on the NORMAL firmware: a hard deadline, POST /rf/test/stop,
+// or ANY reboot returns the radio to normal mesh operation. WiFi + OTA stay up the whole
+// time, so the node is always reachable and OTA-recoverable — this is what makes flashing
+// it to a live gateway safe. While active the mesh radio is dedicated to the emission and
+// all mesh TX/RX is suspended (loop() guard). See docs/trailcam/fcc-certification.md.
+#define GW_RFTEST_MAX_SECS 300          // hard ceiling on a single test window
+static uint32_t s_rftest_until = 0;     // deadline millis(); 0 = not testing
+static char     s_rftest_desc[80] = "";
+static bool rftest_active() { return s_rftest_until != 0; }
+
 // DIRECT frames only (bug 1, 2026-07-16): a transport relay (the surveyor; the dam
 // spine's R1/R2 later) can deliver the leaf's announces across a radio-profile split,
 // and counting them here kept the quiet-leaf scan disarmed for 21 h while every reply
@@ -1806,6 +1818,15 @@ static void wifi_ensure() {
     const WifiCred& n = WIFI_NETS[s_wifi_idx];
     Serial.printf("[gw] WiFi joining \"%s\" (net %u/%u) ...\n",
                   n.ssid, (unsigned)(s_wifi_idx + 1), (unsigned)WIFI_NET_COUNT);
+    // Clear any in-flight association before (re)configuring. Without this the
+    // multi-network fallback wedges: when the current network is out of range the STA
+    // sits in "connecting", and the next WiFi.begin() (this call, for the NEXT network)
+    // fails with ESP_ERR_WIFI_STATE ("sta is connecting, cannot set config") — so the
+    // gateway can never fail over to a reachable network. A cold boot with net-1 absent
+    // then never gets online (2026-07-21: took GW-HOME down after an OTA reboot at a
+    // site where only net-2 was in range). disconnect(true) drops the radio and clears
+    // that state; mode()+begin() below bring it back up fresh on the chosen network.
+    WiFi.disconnect(true);
     WiFi.mode(WIFI_STA);
     WiFi.begin(n.ssid, n.psk);
 }
@@ -2378,6 +2399,71 @@ void setup() {
         s_web.send(200, "text/plain",
                    was ? "hold released, ADR resumes\n" : "no hold was active\n");
     });
+    // Radio test mode: reversible cert-bench emission for §15.247 DTS / 996369-D04
+    // measurements. NON-DESTRUCTIVE — WiFi + OTA stay up, a hard timeout (?secs, clamp
+    // 1..GW_RFTEST_MAX_SECS) auto-reverts, and POST /rf/test/stop reverts immediately.
+    // While active, the mesh radio is dedicated to the emission (all mesh TX/RX suspended).
+    // SAFETY: radiates continuously up to +22 dBm — bench into attenuation/a shield only.
+    //   POST /rf/test?mode=cw&freq=915.0&pwr=17&secs=30
+    //   POST /rf/test?mode=mod&freq=915.0&bw=500&sf=9&cr=5&pwr=17&secs=30
+    s_web.on("/rf/test", HTTP_POST, []() {
+        if (!s_radio_ok || !LoRaInterface::active) {
+            s_web.send(503, "text/plain", "radio absent — cannot run RF test\n");
+            return;
+        }
+        String mode = s_web.hasArg("mode") ? s_web.arg("mode") : String("cw");
+        float  freq = s_web.hasArg("freq") ? s_web.arg("freq").toFloat() : 915.0f;
+        int    pwr  = s_web.hasArg("pwr")  ? s_web.arg("pwr").toInt()    : 17;
+        long   secs = s_web.hasArg("secs") ? s_web.arg("secs").toInt()   : 30;
+        float  bw   = s_web.hasArg("bw")   ? s_web.arg("bw").toFloat()   : 500.0f;
+        int    sf   = s_web.hasArg("sf")   ? s_web.arg("sf").toInt()     : 9;
+        int    cr   = s_web.hasArg("cr")   ? s_web.arg("cr").toInt()     : 5;
+        if (secs < 1) secs = 1;
+        if (secs > GW_RFTEST_MAX_SECS) secs = GW_RFTEST_MAX_SECS;
+        if (pwr < -9) pwr = -9;
+        if (pwr > 22) pwr = 22;
+        if (freq < 902.0f || freq > 928.0f) {
+            s_web.send(400, "text/plain", "freq must be within the 902-928 MHz ISM band\n");
+            return;
+        }
+        bool ok;
+        if (mode == "mod") {
+            ok = LoRaInterface::active->radio_test_mod(freq, bw, sf, cr, (int8_t)pwr);
+        } else {
+            mode = "cw";
+            ok = LoRaInterface::active->radio_test_cw(freq, (int8_t)pwr);
+        }
+        if (!ok) {
+            LoRaInterface::active->radio_test_stop();
+            s_rftest_until = 0;
+            s_web.send(500, "text/plain", "radio rejected the test command — reverted\n");
+            return;
+        }
+        s_rftest_until = millis() + (uint32_t)secs * 1000u;
+        if (!s_rftest_until) s_rftest_until = 1;   // never 0 while active (millis() wrap)
+        if (mode == "mod")
+            snprintf(s_rftest_desc, sizeof(s_rftest_desc),
+                     "MOD %.3f MHz BW%.0f SF%d @ %d dBm for %lds", freq, bw, sf, pwr, secs);
+        else
+            snprintf(s_rftest_desc, sizeof(s_rftest_desc),
+                     "CW %.3f MHz @ %d dBm for %lds", freq, pwr, secs);
+        char resp[192];
+        snprintf(resp, sizeof(resp),
+                 "RF TEST ON: %s. Mesh suspended; auto-reverts (POST /rf/test/stop to end now).\n",
+                 s_rftest_desc);
+        Serial.printf("[gw] rf/test: %s\n", s_rftest_desc);
+        log_event("rf/test start: %s", s_rftest_desc);
+        s_web.send(200, "text/plain", resp);
+    });
+    s_web.on("/rf/test/stop", HTTP_POST, []() {
+        if (!rftest_active()) { s_web.send(200, "text/plain", "no RF test was active\n"); return; }
+        if (LoRaInterface::active) LoRaInterface::active->radio_test_stop();
+        s_rftest_until = 0;
+        s_rftest_desc[0] = 0;
+        Serial.println("[gw] rf/test: stopped by operator -> normal mesh restored");
+        log_event("rf/test stopped by operator");
+        s_web.send(200, "text/plain", "RF test stopped, normal mesh operation restored\n");
+    });
     // Bug-6 diagnosis: dump the RNS/microStore debug ring (see dbglog_push above).
     s_web.on("/debuglog", []() {
         String out;
@@ -2401,6 +2487,28 @@ void setup() {
 }
 
 void loop() {
+    // Radio test mode: while a test emission runs, the radio is dedicated to it —
+    // skip ALL mesh servicing (reticulum RX/TX, ADR, command polls, beats) so nothing
+    // keys the radio over the test carrier. Keep ONLY the web server + OTA + network
+    // alive, so the test is always stoppable (POST /rf/test/stop) and the box stays
+    // OTA-recoverable. The hard deadline guarantees a return to normal even if no stop
+    // ever arrives (operator walked away, laptop died).
+    if (s_rftest_until) {
+        if ((int32_t)(millis() - s_rftest_until) >= 0) {
+            if (LoRaInterface::active) LoRaInterface::active->radio_test_stop();
+            s_rftest_until = 0;
+            s_rftest_desc[0] = 0;
+            Serial.println("[gw] rf/test window expired -> normal mesh operation restored");
+            log_event("rf/test window expired, radio restored");
+            // fall through into the normal loop body this tick
+        } else {
+            s_web.handleClient();
+            ArduinoOTA.handle();
+            net_ensure();
+            return;
+        }
+    }
+
     reticulum.loop();
 
     // Staged "have?" reply — IMMEDIATELY after the radio pump, before any WiFi/HTTP

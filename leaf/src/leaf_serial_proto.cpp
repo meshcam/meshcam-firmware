@@ -15,7 +15,7 @@
 #define LEAF_NODE_SLUG ""
 #endif
 #ifndef LEAF_FW_VERSION
-#define LEAF_FW_VERSION "leaf-0.17.3"
+#define LEAF_FW_VERSION "leaf-0.17.4"
 #endif
 
 // RTC-persisted: PIR wakes mint event ids and emit the serial EVT BEFORE the radio comes
