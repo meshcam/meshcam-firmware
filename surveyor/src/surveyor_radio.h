@@ -22,6 +22,13 @@ bool sv_radio_ok();
 // announce-triggered, so every announce is also a downlink solicitation.
 void sv_radio_announce(const char* status);
 
+// Bring the gateway link up WITHOUT sending a probe (path discovery, profile scan and
+// the link handshake — everything sv_probe_send would do first anyway, so calling this
+// makes the following send free). Exists so the caller can read sv_last_rssi() while
+// standing on THIS spot: the handshake frames the gateway puts on the air are the only
+// downlink measurement available before the header that reports them is composed.
+bool sv_link_ensure();
+
 // Send ONE enveloped Resource (JSON header line + '\n' + body) to the baked gateway
 // destination, establishing (or reusing) the link. Blocks to conclusion or timeout.
 // On return, sv_last_* hold the surveyor-side RF numbers of the most recent frame.

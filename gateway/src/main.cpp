@@ -44,6 +44,7 @@
 #endif
 #ifdef GW_NET_ETH
 #include <ETH.h>            // LAN8720 wired ethernet (LILYGO T-Internet-POE)
+#include <esp_task_wdt.h>   // un-watch IDLE0 while the SD mount probe may busy-spin
 #include <UDPInterface.h>   // vendored (lib/udp_interface): RNS-over-UDP on the wire
 #endif
 #include <ArduinoOTA.h>     // network firmware updates (espota) over the WG tunnel
@@ -52,7 +53,7 @@
 #define GW_SITE "home"
 #endif
 #ifndef GW_FW_VERSION
-#define GW_FW_VERSION "gateway-0.14.4"
+#define GW_FW_VERSION "gateway-0.15.0"
 #endif
 #ifndef GW_VIEW_HOST
 #define GW_VIEW_HOST "trailcam.example.com"   // family gallery shown on the OLED
@@ -315,6 +316,48 @@ static void log_event(const char* fmt, ...) {
     s_evt_head = (s_evt_head + 1) % GW_EVT_SLOTS;
 }
 
+// Custody revocation, defined with the dedup ring further down; the SD queue below needs
+// it when it evicts or permanently drops a frame.
+static void have_unnote(const char* eid, const char* kind);
+
+// --- microSD spool queue (gateway-0.15.0) -----------------------------------------------
+// Why this exists: the upload slot above is DEPTH 1, and until 0.15.0 that meant any
+// uplink outage longer than one capture interval DESTROYED every frame but the newest —
+// the queue-full path evicted the older pending frame, and thumbs and fulls shared the
+// single slot, so a 5 KB thumb could evict a 135 KB full mid-retry. However long the
+// outage, the server got ONE frame instead of a backlog. That is data loss, not latency,
+// and it contradicted the store-and-forward promise the product is sold on.
+//
+// The flash spool cannot be grown to fix it: partitions_ota_4mb.csv allocates all
+// 4.000 MB (nvs + otadata + app0 + app1 + spiffs) with ZERO bytes free, and the only
+// slack is an OTA slot — i.e. the rollback that keeps a bad flash from bricking a node
+// 20 ft up a tree. So depth lives on the T-Internet-POE's TF slot instead: SD_MMC in
+// 1-BIT mode (CLK 14 / CMD 15 / D0 2) contends with nothing here — ethernet is LAN8720
+// RMII, the Core1262 has its own SPI set (33/32/35/4).
+//
+// Shape:
+//   * one file per (event, kind) under /q, named <captured_at as 8 hex>.QT (thumb) or
+//     .QF (full). 8.3-safe, and the NAME alone carries both the drain order and the
+//     kind — so there is no index file to desync or corrupt, and a scan never has to
+//     open a file to decide what to do next.
+//   * each file is a JSON header line + '\n' + the bare JPEG. The uploader seeks past
+//     the header and streams the body straight off the card; the heap never holds a full.
+//   * writes land in /q/TMP.TMP and are ATOMICALLY RENAMED in. A name that isn't
+//     8-hex + .QT/.QF is never treated as queued, so a torn write is inert, not a
+//     half-frame that uploads as garbage.
+//   * drain NEWEST-FIRST, thumb before full at equal capture time (the ingest API's own
+//     thumb-first/full-later philosophy), older frames backfilled behind. Delete ONLY
+//     after a 2xx; 4xx stays permanent -> drop. Ingest is idempotent per
+//     (event_id, kind), so re-sending after an ambiguous failure is safe.
+//   * reboots KEEP the queue. This deliberately REVERSES the old wipe-on-boot: only the
+//     partial assembly (TMP.TMP) is worthless across a reboot, completed frames are not.
+//   * no card / mount fail / write fail -> fall back to the depth-1 slot above, never
+//     crash, and RAISE A VISIBLE ALARM (self-beat field + web ring). Silent degradation
+//     is exactly how the depth-1 defect stayed invisible for a month.
+#ifdef GW_SD_QUEUE
+#include "sd_queue.inc"
+#endif   // GW_SD_QUEUE
+
 // --- /debuglog ring (bug 6): RNS NOTICE+ lines and microStore events, cable-free -------
 // The 07-15/16 announce wedge dropped announces on branches that logged at DEBUG or not
 // at all, and the gateway rarely has a serial cable attached in the field. Patch 5/6
@@ -483,6 +526,30 @@ static void web_root() {
              s_roster_n, GW_ROSTER_MAX,
              s_roster_n ? "" : " — TOFU armed, first direct health announce pins");
     h += line;
+#ifdef GW_SD_QUEUE
+    // The glanceable half of the alarm: no card here means outages lose frames, and this
+    // page is what someone standing at the tower with a phone actually looks at.
+    if (!s_sdq.mounted) {
+        snprintf(line, sizeof(line),
+                 "<br><b style=color:#f88>upload queue: NO CARD — DEPTH 1, an outage "
+                 "loses every frame but the newest</b> (fit a microSD in the TF slot; "
+                 "%lu mount attempt(s) failed)", (unsigned long)s_sdq.mount_fails);
+    } else {
+        char ago[24] = "-";
+        const long age = sdq_oldest_age_s();
+        if (age >= 0) human_ago((uint32_t)age * 1000u, ago, sizeof(ago));
+        snprintf(line, sizeof(line),
+                 "<br>upload queue: %lu on card (%lu thumb / %lu full), oldest %s, "
+                 "%lu/%lu MB free, evicted %lu, write/read errs %lu/%lu",
+                 (unsigned long)s_sdq.depth, (unsigned long)s_sdq.thumbs,
+                 (unsigned long)s_sdq.fulls, ago,
+                 (unsigned long)(s_sdq.free_bytes >> 20),
+                 (unsigned long)(s_sdq.card_bytes >> 20),
+                 (unsigned long)s_sdq.evicted, (unsigned long)s_sdq.write_errors,
+                 (unsigned long)s_sdq.read_errors);
+    }
+    h += line;
+#endif
     for (int i = 0; i < s_roster_n; i++) {
         const LeafEntry& L = s_roster[i];
         char ago[24] = "never (this boot)";
@@ -509,7 +576,10 @@ static void web_root() {
 // Queued from RNS callbacks (no blocking HTTP inside reticulum.loop), drained in loop().
 // Fire-and-forget per the contract: a dropped beat is fine, a stalled radio isn't.
 #define GW_BEAT_SLOTS 6
-static char s_beats[GW_BEAT_SLOTS][960];   // sized for a hex-dumped announce frame
+// Sized for the two big ones: a hex-dumped announce frame, and the self-beat with a FULL
+// 4-leaf roster + the sd_queue block (0.15.0). vsnprintf TRUNCATES silently, and a
+// truncated beat is invalid JSON the backend 422s — so keep the headroom honest.
+static char s_beats[GW_BEAT_SLOTS][1120];
 static int  s_beat_n = 0;
 
 static void queue_beat(const char* fmt, ...) {
@@ -664,9 +734,20 @@ static void have_unnote(const char* eid, const char* kind) {
             s_have[i].event_id[0] = 0;
 }
 
+
 // Take ownership of a bare-JPEG buffer + metadata (zero-copy for thumbs).
 static void queue_upload_owned(uint8_t* jpeg, size_t len, const char* eid,
                                const char* cam, const char* kind, long long capts) {
+#ifdef GW_SD_QUEUE
+    // Deep queue first: the card holds hundreds of frames, so an outage costs nothing
+    // but latency. Only a missing or failing card falls through to the depth-1 slot.
+    if (s_sdq.mounted && sdq_enqueue(eid, cam, kind, capts, jpeg, nullptr, len)) {
+        free(jpeg);
+        note_capture(cam, eid);
+        have_note(eid, kind);
+        return;
+    }
+#endif
     if (s_pending.jpeg || s_pending.spooled) {
         Serial.println("[gw] upload queue full -> DROPPING the older pending frame");
         have_unnote(s_pending.event_id, s_pending.kind);
@@ -686,6 +767,23 @@ static void queue_upload_owned(uint8_t* jpeg, size_t len, const char* eid,
 // the uploader streams it from flash.
 static void queue_upload_spooled(size_t len, const char* eid,
                                  const char* cam, long long capts) {
+#ifdef GW_SD_QUEUE
+    // Hand the completed full over to the card and give the flash spool straight back —
+    // assembly stays on LittleFS (that short-handle chunk-write dance is hard-won; see
+    // spool_write_chunk) and only the finished frame is copied across, once.
+    if (s_sdq.mounted) {
+        File src = LittleFS.open(GW_SPOOL_JPG, FILE_READ);
+        const bool ok = src && src.size() == len &&
+                        sdq_enqueue(eid, cam, "full", capts, nullptr, &src, len);
+        if (src) src.close();
+        if (ok) {
+            LittleFS.remove(GW_SPOOL_JPG);   // the card owns this frame now
+            note_capture(cam, eid);
+            have_note(eid, "full");
+            return;
+        }
+    }
+#endif
     if (s_pending.jpeg || s_pending.spooled) {
         Serial.println("[gw] upload queue full -> DROPPING the older pending frame");
         have_unnote(s_pending.event_id, s_pending.kind);
@@ -1443,14 +1541,24 @@ static void maybe_time_sync(LeafEntry& L) {
 #define GW_RF_UP_HEADROOM_DB      12.0f
 #define GW_RF_DOWN_HEADROOM_DB    6.0f
 #ifndef GW_RF_DOWNLINK_ASYM_DB
-#define GW_RF_DOWNLINK_ASYM_DB    13.0f            // FIELD-VALIDATED 07-17 range walk:
-#endif                                             // true asym is level-dependent (-15 dB
-                                                   // strong -> -8 dB at the edge), i.e.
-                                                   // 6-9 dB at the decision thresholds --
-                                                   // 13 is deliberately ~5 dB conservative
-                                                   // (safety direction; completion is
-                                                   // contention-limited before RSSI-limited
-                                                   // anyway). Data: homelab
+#define GW_RF_DOWNLINK_ASYM_DB    13.0f            // FIELD-VALIDATED twice. DO NOT TRIM.
+#endif                                             // 07-17 (office) measured 6-9 dB at the
+                                                   // decision thresholds and this comment
+                                                   // used to call 13 "~5 dB conservative".
+                                                   // WITHDRAWN: 08-07 (north40) replicated
+                                                   // the same protocol on an UNCONTENDED
+                                                   // channel and measured -13.1 dB (n=9) in
+                                                   // that band. The office's low figure was
+                                                   // survivorship bias -- its probes were
+                                                   // dying to contention, and a dead probe
+                                                   // yields no asymmetry sample, so the
+                                                   // surviving edge samples skewed
+                                                   // small-asymmetry. 13 is ACCURATE, not
+                                                   // padded; trimming it toward 8 would grant
+                                                   // up-shifts the downlink cannot carry.
+                                                   // Asym still compresses past ~-120 (both
+                                                   // walks agree) but that is below every
+                                                   // threshold here. Data: homelab
                                                    // docs/trailcam/adr-field-calibration.md
                                                    // (build-flag override: bench tests
                                                    // fake a huge asym to force down-shifts
@@ -1462,6 +1570,20 @@ static void maybe_time_sync(LeafEntry& L) {
 #define GW_RF_GRANT_TTL_S         (24 * 3600)      // matches the leaf's default
 #define GW_RF_SCAN_SILENT_MS      (90 * 1000u)     // leaf quiet this long off-base -> scan
 #define GW_RF_SCAN_TOGGLE_MS      (30 * 1000u)
+
+// ADR stepping is confined to ONE profile family, because the table stopped being
+// monotonically ordered when the certified ladder was appended (lora_profiles.h,
+// 2026-08-07): idx 3 (sf12/bw500) is the FAR end of the cert family sitting directly
+// after idx 2 (sf7/bw250), the NEAR end of the legacy one. Unclamped, `cur + 1` walks
+// straight out of the family — and it always succeeds, because the headroom gate tests
+// against the DESTINATION rung's floors and a far rung advertises very low ones
+// (-130 dBm / -14 dB), which every working link clears by tens of dB. The result is an
+// "up-shift" onto the slowest rung on the board, followed by 4 and 5 for the same
+// reason. lora_profiles.h names this exact hazard and prescribes this exact fix
+// ("clamp to one family"). Crossing families is a flag day (both ends go mutually deaf
+// across a bandwidth change), never something ADR may do on its own.
+#define GW_RF_FAMILY_MIN  ((uint8_t)(LORA_PROFILE_BASE <= 2 ? 0 : 3))
+#define GW_RF_FAMILY_MAX  ((uint8_t)(LORA_PROFILE_BASE <= 2 ? 2 : LORA_PROFILE_COUNT - 1))
 
 static void rf_beat(const char* event, uint8_t idx, float snr, float rssi,
                     float headroom) {
@@ -1593,7 +1715,7 @@ static void maybe_grant_profile(LeafEntry& L, int cmds_sent) {
     float         headroom = NAN;
     const bool up_blocked = s_rf.up_reverts >= GW_RF_UP_REVERTS_MAX &&
                             millis() - s_rf.up_revert_ms < GW_RF_UP_BACKOFF_MS;
-    if (cur + 1 < LORA_PROFILE_COUNT && !up_blocked) {
+    if (cur < GW_RF_FAMILY_MAX && !up_blocked) {
         const float rssi_hr = dl_est - LORA_PROFILES[cur + 1].rssi_floor;
         const float snr_hr  = snr    - LORA_PROFILES[cur + 1].snr_floor;
         if (rssi_hr >= GW_RF_UP_HEADROOM_DB && snr_hr >= GW_RF_UP_HEADROOM_DB) {
@@ -1601,7 +1723,7 @@ static void maybe_grant_profile(LeafEntry& L, int cmds_sent) {
             headroom = rssi_hr;
         }
     }
-    if (want == cur && cur > 0) {
+    if (want == cur && cur > GW_RF_FAMILY_MIN) {
         const float rssi_hr = dl_est - LORA_PROFILES[cur].rssi_floor;
         const float snr_hr  = snr    - LORA_PROFILES[cur].snr_floor;
         if (rssi_hr <= GW_RF_DOWN_HEADROOM_DB || snr_hr <= GW_RF_DOWN_HEADROOM_DB) {
@@ -1870,86 +1992,11 @@ static long long json_ll(const char* json, const char* key) {
 // from three segments (head / body / tail). The body segment is either a RAM buffer
 // (thumbs) or an open LittleFS File (spooled fulls) — either way a 135 KB full never
 // touches the heap.
-class ConcatStream : public Stream {
-public:
-    ConcatStream(const String& head, const uint8_t* body, size_t blen, const String& tail)
-        : _h(head), _b(body), _bl(blen), _t(tail) {}
-    ConcatStream(const String& head, File* body, size_t blen, const String& tail)
-        : _h(head), _f(body), _bl(blen), _t(tail) {}
-    int available() override {
-        size_t total = _h.length() + _bl + _t.length();
-        return (int)(total - _pos);
-    }
-    int read() override {
-        uint8_t c;
-        return readBytes(&c, 1) == 1 ? c : -1;
-    }
-    size_t readBytes(char* out, size_t want) { return readBytes((uint8_t*)out, want); }
-    size_t readBytes(uint8_t* out, size_t want) {
-        size_t done = 0;
-        while (done < want) {
-            size_t hl = _h.length();
-            if (_pos < hl) {
-                out[done++] = _h[_pos++];
-            } else if (_pos < hl + _bl) {
-                size_t off = _pos - hl;
-                size_t n = min(want - done, _bl - off);
-                if (_f) {
-                    size_t got = _f->read(out + done, n);
-                    if (got == 0) break;   // short file (shouldn't happen): end stream
-                    n = got;
-                } else {
-                    memcpy(out + done, _b + off, n);
-                }
-                done += n;
-                _pos += n;
-            } else {
-                size_t off = _pos - hl - _bl;
-                if (off >= (size_t)_t.length()) break;
-                out[done++] = _t[off];
-                _pos++;
-            }
-        }
-        return done;
-    }
-    int peek() override { return -1; }
-    size_t write(uint8_t) override { return 0; }
-private:
-    const String&  _h;
-    const uint8_t* _b = nullptr;
-    File*          _f = nullptr;
-    size_t         _bl;
-    const String&  _t;
-    size_t         _pos = 0;
-};
+#include "sd_queue_upload.inc"
 
+// The depth-1 slot's uploader — now the FALLBACK path, reached only when no usable card
+// is present. Returns true when the frame is handled (uploaded or permanently dropped).
 static bool upload_pending() {
-    time_t now = time(nullptr);
-    if (now < 1600000000) {
-        Serial.println("[gw] clock not NTP-synced yet -> deferring upload");
-        return false;
-    }
-    long long capts = s_pending.captured_at;
-    if (capts < 1600000000) capts = (long long)now;
-
-    static const char* B = "----tcgw7f3a";
-    String head;
-    head.reserve(768);
-    auto field = [&](const char* name, const String& val) {
-        head += "--"; head += B; head += "\r\n";
-        head += "Content-Disposition: form-data; name=\""; head += name; head += "\"\r\n\r\n";
-        head += val; head += "\r\n";
-    };
-    field("site", GW_SITE);
-    field("camera", s_pending.camera);
-    field("event_id", s_pending.event_id);
-    field("captured_at", String(capts));
-    field("kind", s_pending.kind);
-    head += "--"; head += B; head += "\r\n";
-    head += "Content-Disposition: form-data; name=\"file\"; filename=\"";
-    head += s_pending.event_id; head += ".jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
-    String tail = String("\r\n--") + B + "--\r\n";
-
     // Spooled fulls stream from flash; reopen per attempt so a retry restarts at 0.
     File spool;
     if (s_pending.spooled) {
@@ -1961,39 +2008,17 @@ static bool upload_pending() {
             return true;   // treat as handled; the server re-delivers the command
         }
     }
-
-    WiFiClientSecure tls;
-    tls.setInsecure();   // no CA store; the token is the auth, the LAN path is ours
-    HTTPClient http;
-    http.setConnectTimeout(10000);
-    http.setTimeout(30000);
-    bool ok = false;
-    if (http.begin(tls, GW_INGEST_URL)) {
-        http.addHeader("Authorization", "Bearer " GW_INGEST_TOKEN);
-        http.addHeader("Content-Type", String("multipart/form-data; boundary=") + B);
-        ConcatStream mem(head, s_pending.jpeg, s_pending.len, tail);
-        ConcatStream fil(head, &spool,         s_pending.len, tail);
-        ConcatStream* body = s_pending.spooled ? &fil : &mem;
-        size_t total = head.length() + s_pending.len + tail.length();
-        int code = http.sendRequest("POST", body, total);
-        ok = code >= 200 && code < 300;
-        Serial.printf("[gw] upload %s %s (%u bytes) -> HTTP %d%s\n",
-                      s_pending.event_id, s_pending.kind, (unsigned)s_pending.len,
-                      code, ok ? "" : " (will retry)");
-        if (ok) s_stats.uploads_ok++;
-        log_event("upload %s %s -> HTTP %d", s_pending.event_id, s_pending.kind, code);
-        if (!ok && code >= 400 && code < 500) {
-            Serial.printf("[gw] 4xx is permanent -> dropping: %s\n",
-                          http.getString().substring(0, 200).c_str());
-            ok = true;   // treat as handled; retrying a malformed frame forever helps nobody
-        }
-        http.end();
-    } else {
-        Serial.println("[gw] http.begin failed");
-    }
+    const UploadOutcome r =
+        upload_body(s_pending.event_id, s_pending.camera, s_pending.kind,
+                    s_pending.captured_at, s_pending.jpeg,
+                    s_pending.spooled ? &spool : nullptr, s_pending.len);
     if (spool) spool.close();
-    return ok;
+    return r != UP_RETRY;
 }
+
+#ifdef GW_SD_QUEUE
+#include "sd_queue_drain.inc"
+#endif   // GW_SD_QUEUE
 
 // --- site name (address) fetch ----------------------------------------------------------
 // GET /api/v1/site?slug=<GW_SITE> with the device token; cache the display name in NVS.
@@ -2192,6 +2217,30 @@ static void emit_self_beat() {
                           s_roster[i].slug[0] ? "\"" : "");
         strlcat(roster, "]", sizeof(roster));
     }
+    // Upload queue health. `alarm` is the field to page on: no card (or a card that went
+    // bad) means this gateway is back to depth 1 and an outage loses frames, which is the
+    // whole defect the queue exists to close. Empty string on builds with no TF slot.
+    char sdq[240] = "";
+#ifdef GW_SD_QUEUE
+    {
+        const long age = sdq_oldest_age_s();
+        char agec[24];
+        if (age < 0) snprintf(agec, sizeof(agec), "null");
+        else         snprintf(agec, sizeof(agec), "%ld", age);
+        snprintf(sdq, sizeof(sdq),
+                 ",\"sd_queue\":{\"card\":%s,\"depth\":%lu,\"thumbs\":%lu,\"fulls\":%lu,"
+                 "\"oldest_age_s\":%s,\"free_mb\":%lu,\"card_mb\":%lu,\"evicted\":%lu,"
+                 "\"write_errors\":%lu,\"read_errors\":%lu,\"mount_fails\":%lu"
+                 ",\"alarm\":%s}",
+                 s_sdq.mounted ? "true" : "false", (unsigned long)s_sdq.depth,
+                 (unsigned long)s_sdq.thumbs, (unsigned long)s_sdq.fulls, agec,
+                 (unsigned long)(s_sdq.free_bytes >> 20),
+                 (unsigned long)(s_sdq.card_bytes >> 20),
+                 (unsigned long)s_sdq.evicted, (unsigned long)s_sdq.write_errors,
+                 (unsigned long)s_sdq.read_errors, (unsigned long)s_sdq.mount_fails,
+                 s_sdq.mounted ? "null" : "\"no_card_depth_1\"");
+    }
+#endif
 
     queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
                "\"uptime_s\":%lu,\"fw_version\":\"" GW_FW_VERSION "\","
@@ -2201,7 +2250,7 @@ static void emit_self_beat() {
                "\"uploads\":%lu,\"res_ok\":%lu,\"res_fail\":%lu,"
                "\"announces\":%lu,\"announces_rf\":%lu,\"announces_relayed\":%lu,"
                "\"announces_foreign\":%lu,\"leaf_pin\":%s%s%s,\"roster\":%s,"
-               "\"chunks\":%lu}}",
+               "\"chunks\":%lu%s}}",
                GW_SITE, GW_SITE, (unsigned long)(millis() / 1000),
                net_rssi(), reset_reason_str(),
                (unsigned)ESP.getFreeHeap(), net_desc().c_str(),
@@ -2219,7 +2268,7 @@ static void emit_self_beat() {
                (unsigned long)s_stats.announces_foreign,
                s_roster_n ? "\"" : "", s_roster_n ? s_roster[0].hex : "null",
                s_roster_n ? "\"" : "", roster,
-               (unsigned long)s_stats.chunks);
+               (unsigned long)s_stats.chunks, sdq);
 }
 
 // --- bring-up ---------------------------------------------------------------------------
@@ -2250,6 +2299,10 @@ void setup() {
     RNS::Utilities::OS::register_filesystem(filesystem);
     // Crash leftovers: a spool interrupted by a reboot is worthless (the server
     // re-delivers the fetch command), and stale files would confuse the next rename.
+    // Note this is the LittleFS staging area only — /spool.jpg's metadata (event_id,
+    // camera, captured_at) lived in RAM, so a leftover is an unlabelled JPEG nobody can
+    // ingest. The SD queue below is the opposite: its entries carry their own header and
+    // are deliberately KEPT across a reboot.
     if (LittleFS.exists(GW_SPOOL_PART)) LittleFS.remove(GW_SPOOL_PART);
     if (LittleFS.exists(GW_SPOOL_JPG))  LittleFS.remove(GW_SPOOL_JPG);
     // Census + cleanup: microReticulum persists per-transfer resource hashlists under
@@ -2284,6 +2337,13 @@ void setup() {
     }
     Serial.printf("[gw] littlefs: %u / %u bytes used\n",
                   (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes());
+    // Deep upload queue on the TF slot: the first mount attempt is DELIBERATELY NOT made
+    // here. It happens in sdq_loop(), after net_setup() and ota_setup() have run, and it
+    // runs in a timeout-bounded task (see sdq_probe_spawn). Mounting here was a boot hang
+    // on an empty slot — bench-proven 2026-08-09 — and because it sits ~200 lines ahead
+    // of net_setup(), a hang meant no ethernet and no OTA on a firmware with no rollback:
+    // an unrecoverable board, which on the tower is a climb. Never put a call that can
+    // block ahead of the network and OTA. See homelab docs/trailcam/gateway-sd-queue.md.
 
     lora_interface = new LoRaInterface();
     // ADR: resume listening on the last profile we granted the leaf (NVS). If the leaf
@@ -2675,6 +2735,12 @@ void loop() {
     if (!radio_busy()) {
         post_cmd_acks();   // bug 8: relay leaf receipt acks (blocking TLS, radio-quiet)
         post_beats();
+#ifdef GW_SD_QUEUE
+        sdq_loop();        // re-mount attempts (card inserted with no reboot) + stats
+        // One frame per pass: coming back through loop() between POSTs keeps the radio
+        // and the web server serviced while a long backlog drains.
+        if (s_sdq.mounted && s_sdq.depth && net_up()) sdq_drain_one();
+#endif
         if ((s_pending.jpeg || s_pending.spooled) && net_up()) {
             if (upload_pending()) pending_clear();
         }

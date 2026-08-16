@@ -36,7 +36,7 @@ daughter-board protocol.
 | Dir | What it is | Target |
 |---|---|---|
 | `leaf/` | The camera node: PIR wake → capture → tiny-ML gate → RNS `Resource` over LoRa → deep sleep. OTA, serial command protocol, adaptive radio profiles (ADR), store-and-forward spool. | ESP32-S3 + SX1262 |
-| `gateway/` | LoRa/RNS in, network + HTTPS out; pushes to any [ingest-API](https://github.com/meshcam/meshcam-api) server. No PC in the data path. Two board variants: Heltec V3 (WiFi uplink, OLED status) and T-Internet-POE (wired ethernet + PoE, hand-wired SX1262, RNS-over-UDP on the LAN). | Heltec V3 / LILYGO T-Internet-POE |
+| `gateway/` | LoRa/RNS in, network + HTTPS out; pushes to any [ingest-API](https://github.com/meshcam/meshcam-api) server. No PC in the data path. Store-and-forward on microSD: an uplink outage queues frames on the card and drains newest-first when the pipe returns. Two board variants: Heltec V3 (WiFi uplink, OLED status) and T-Internet-POE (wired ethernet + PoE, hand-wired SX1262, RNS-over-UDP on the LAN). | Heltec V3 / LILYGO T-Internet-POE |
 | `bridge-poe/` | Ethernet bring-up validation for the T-Internet-POE (RNS-over-UDP interop with Python RNS; superseded by `gateway/`'s `poe-*` envs for deployment). | LILYGO T-Internet-POE |
 | `bridge-host/` | Dev bridge: leaf serial console → ingest API from a laptop. The "dev kit" gateway. | any host w/ Python |
 | `validation/` | The bench-validation gates that proved the architecture (kept as engineering history): `gate-a-resource` (RNS Resource on-device), `gate-b-coexist` (camera + RNS + TFLite on one MCU), `gate-a2-interop` (interop with reference Python RNS). | — |

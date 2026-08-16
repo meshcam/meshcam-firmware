@@ -749,11 +749,131 @@ static void arm_and_sleep() {
     esp_deep_sleep_start();   // never returns; MCU resets into setup() on next wake
 }
 
-#ifdef LEAF_SD_PROBE
+#ifdef LEAF_SDQ_WIRE
+// Wire-format test: posts REAL multipart bodies at a probe server that checks
+// every byte. Complements the gate harness, which injects outcomes and so cannot see a
+// malformed body at all.
+#include "sdq_wire.inc"
+
+#elif defined(LEAF_SDQ_GATES)
+// Queue acceptance gates against the REAL queue (gateway/src/sd_queue.inc), run on this
+// board because the gateway's TF slot cannot mount a card. See the file for what it does
+// and — importantly — what it does not cover.
+#include "sdq_gates.inc"
+
+#elif defined(LEAF_SD_BENCH)
+// Measure microSD write throughput on the v0.6 PCB, SPI mode vs SDMMC 1-bit on
+// the SAME card, so the v1.0 respin can route the card on data rather than an
+// estimate. See the file for the method and for what v0.6 physically cannot answer.
+#include "sd_bench.inc"
+
+#elif defined(LEAF_SD_PCB_PROBE)
+// Diagnostic for the CUSTOM LEAF PCB's microSD — which is SPI mode (CS 43 on the shared
+// radio bus SCK 47 / MOSI 48 / MISO 38), NOT the SD_MMC slot the bench Freenove has.
+// Do not confuse the two: a pass here says nothing about the gateway, whose card is
+// SD_MMC on entirely different pins and a different driver.
+//
+// WHY: on the gateway board (T-Internet-POE) the SD never worked, and the cause turned
+// out to be one missing pull-up on the DATA line — CMD and CLK had theirs, D0 did not
+// (measured 2026-08-09, homelab docs/trailcam/gateway-pcb.md "Lessons from the
+// T-Internet-POE"). The leaf PCB is a different layout that has never had its microSD
+// brought up (step 3 of the 9-step gate), and its v1.0 respin is still open — so check
+// for the same class of defect while a schematic edit is still cheap.
+//
+// TWO THINGS THIS EXPLOITS:
+//  1. Same pull-up test as LEAF_PIN_MONITOR below: switch the chip's weak (~45k) pulldown
+//     onto a line and read it. A real 10k pull-up wins and the pin still reads high.
+//  2. The leaf's 10k CS pull-up goes to LORA_3V3 — the SWITCHED rail (Q2, gated by
+//     IO44). So it should be ABSENT with the rail off and PRESENT with it on. That single
+//     comparison proves the resistor AND the rail in one shot; if CS looks the same both
+//     ways, one of them is wrong and the next test tells you which.
+//
+// Powering the rail is mandatory: the card is unpowered until IO44 goes LOW, and an
+// unpowered card looks exactly like a dead slot. That is the first thing to suspect here.
+#include <SPI.h>
+#include <SD.h>
+#include "leaf_rails.h"
+
+#ifndef LEAF_SD_SPI_CS
+#error "LEAF_SD_PCB_PROBE is for the custom leaf PCB — build the leaf-pcb-sd-probe env"
+#endif
+#define PCB_SD_SCK  47
+#define PCB_SD_MOSI 48
+#ifndef RADIO_MISO_PIN
+#define RADIO_MISO_PIN 38
+#endif
+
+static void pcb_characterize(const char* name, int pin) {
+    pinMode(pin, INPUT_PULLDOWN); delay(8); int pd = digitalRead(pin);
+    pinMode(pin, INPUT_PULLUP);   delay(8); int pu = digitalRead(pin);
+    pinMode(pin, INPUT);
+    const char* verdict =
+        (pd == 1 && pu == 1) ? "HELD UP  -> a real pull-up IS present"
+      : (pd == 0 && pu == 1) ? "not held up -> no pull-up here"
+      : (pu == 0)            ? "DRAGGED DOWN -> driven low or shorted"
+                             : "inconclusive";
+    Serial.printf("    %-5s (IO%-2d): %s\n", name, pin, verdict);
+}
+
+void setup() {
+    Serial.begin(LEAF_BAUD);
+    uint32_t t0 = millis();
+    while (!Serial && millis() - t0 < 2000) delay(50);
+    delay(300);
+    Serial.println();
+    Serial.println("==================================================");
+    Serial.println(" LEAF PCB microSD TEST  (SPI mode, CS=43)");
+    Serial.println("==================================================");
+
+    Serial.println("STEP 1 - pull-ups with the SD/radio rail OFF");
+    Serial.println("         (CS's pull-up goes to the switched rail, so expect NONE here)");
+    leaf_radio_rail(false);
+    delay(50);
+    pcb_characterize("CS",   LEAF_SD_SPI_CS);
+    pcb_characterize("MISO", RADIO_MISO_PIN);
+
+    Serial.println("STEP 2 - same lines with the rail ON (this is the real test)");
+    leaf_radio_rail(true);
+    delay(50);
+    pcb_characterize("CS",   LEAF_SD_SPI_CS);
+    pcb_characterize("MISO", RADIO_MISO_PIN);
+    Serial.println("    (CS should change from 'not held up' to 'HELD UP'. If it never");
+    Serial.println("     comes up, either the 10k is missing or the rail is not powering.)");
+
+    Serial.println();
+    Serial.println("STEP 3 - can it actually talk to the card?");
+    SPI.begin(PCB_SD_SCK, RADIO_MISO_PIN, PCB_SD_MOSI, LEAF_SD_SPI_CS);
+    bool ok = SD.begin(LEAF_SD_SPI_CS, SPI);
+    if (!ok) {
+        Serial.println("    mount FAILED");
+    } else {
+        Serial.printf("    mount OK - card type=%d, %llu MB\n",
+                      (int)SD.cardType(),
+                      (unsigned long long)(SD.cardSize() / (1024ULL * 1024ULL)));
+        File f = SD.open("/leafprobe.txt", FILE_WRITE);
+        if (f) { f.println("hello from leaf pcb sd probe"); f.close(); }
+        f = SD.open("/leafprobe.txt", FILE_READ);
+        if (f) {
+            Serial.printf("    wrote + read back: %s\n", f.readStringUntil('\n').c_str());
+            f.close();
+        } else {
+            Serial.println("    write/readback FAILED (mounted but not usable)");
+        }
+        SD.end();
+    }
+    Serial.println();
+    Serial.println("Done. Reset to re-run. Rail left ON.");
+    Serial.println("==================================================");
+}
+
+void loop() { delay(1000); }
+
+#elif defined(LEAF_SD_PROBE)
 // Diagnostic: isolate the microSD from the rest of the stack. Mount (SD_MMC 1-bit on the
 // Freenove slot pins), print card info, write + read back a test file, loop. No sleep, no
 // camera, no radio. Use to tell a hardware problem (card/slot/pins) from an interaction
 // bug in the full firmware (SD after camera/radio init).
+// BENCH FREENOVE ONLY — the custom PCB's card is SPI mode; use LEAF_SD_PCB_PROBE there.
 #include <SD_MMC.h>
 void setup() {
     Serial.begin(LEAF_BAUD);

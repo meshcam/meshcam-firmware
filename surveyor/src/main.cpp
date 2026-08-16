@@ -15,6 +15,14 @@
  * probe/big rows carry surveyor-side RF numbers (the gateway's proof as heard here);
  * ack rows carry the gateway-side numbers downlinked as {"kind":"probe_ack"}.
  *
+ * The downlink half also rides UP now: leaf_rssi/leaf_snr, measured off the
+ * link handshake before the header is composed, go into the probe envelope, which the
+ * gateway pastes verbatim into extra.probe and the ingest already reads into
+ * probes.leaf_rssi/leaf_snr. Before this the downlink existed ONLY in the CSV above,
+ * i.e. two walks of the BINDING direction (13.1 dB weaker than the uplink at the
+ * decision band) were one `wipe` away from gone. The CSV is still the fuller record —
+ * it keeps the failures, which never reach the gateway at all.
+ *
  * ADR: since gateway-0.9.0 identity pinning (outage bug 7), the gateway treats the
  * surveyor as FOREIGN — it still answers probes (probe_ack) and hands hello a time_sync,
  * but never grants it off base. Probes only close while the gateway is parked on base
@@ -61,6 +69,14 @@ static uint32_t announce_gap_ms() { return 24000 + (esp_random() % 13000); }
 #define RX_WINDOW_MS       8000           // post-announce listen (grants/acks/time_sync)
 #define REVERT_SILENT_MS   90000          // off-base and deaf this long -> back to base
 #define CSV_PATH           "/probes.csv"
+
+// Hard ceiling on the probe envelope header. The gateway searches only the FIRST 256
+// bytes of a resource for the header's newline (on_resource_concluded); a header that
+// overruns that window is not recognised as a probe at all — it falls through to
+// queue_upload() and 5 KB of xorshift padding gets posted as a photograph. 250 leaves
+// room under it for the longest realistic slug + coordinates; anything that would not
+// fit sheds the optional leaf RF fields instead of truncating into invalid JSON.
+#define PROBE_HDR_MAX      250
 
 // Auto-sleep: a surveyor forgotten ON is not harmless — it announces + RELAYS forever
 // (Transport mode), burning airtime and its cell. The office-leaf outage (2026-07-15,
@@ -317,8 +333,40 @@ static void probe(bool big) {
             body[i] = (uint8_t)x;
         }
 
-        char hdr[256];
-        snprintf(hdr, sizeof(hdr),
+        // Link FIRST, then compose the header. The link handshake is the only
+        // gateway traffic that lands on the air before the header that reports it, so
+        // it is the only downlink reading that is honestly attributable to THIS pin —
+        // by the time the resource acks arrive the header is already written, and by
+        // the next probe the walker has moved. sv_probe_send reuses the open link, so
+        // this costs nothing; t0 stays above it to keep the CSV `ms` column meaning
+        // what it has always meant (link setup included — that is where seq 76's 79 s
+        // went, north40-range-walk.md).
+        const uint32_t t0 = millis();
+        const bool linked = sv_link_ensure();
+
+        // Only report a number the gateway actually put on the air during THIS probe.
+        // last_rssi is sticky: it survives from the previous probe at the previous
+        // SPOT (seq 76 and 77 of the 08-07 dump share -122/-4.2 to the decimal), and a
+        // stale reading pinned to a new position is worse than no reading at all.
+        const bool rf_fresh = linked && !isnan(sv_last_rssi()) &&
+                              sv_ms_since_rx() <= millis() - t0;
+        char rf[40] = "";
+        if (rf_fresh)
+            snprintf(rf, sizeof(rf), ",\"leaf_rssi\":%.0f,\"leaf_snr\":%.1f",
+                     sv_last_rssi(), sv_last_snr());
+
+        char hdr[PROBE_HDR_MAX + 8];
+        int hlen = snprintf(hdr, sizeof(hdr),
+                 "{\"kind\":\"probe\",\"camera\":\"%s\",\"event_id\":\"prb-%lu-%u\","
+                 "\"captured_at\":%lld,\"seq\":%lu,\"lat\":%.6f,\"lon\":%.6f,"
+                 "\"alt\":%.1f,\"hdop\":%.2f,\"sats\":%u,\"fix\":%d,"
+                 "\"part\":%u,\"parts\":%u%s}",
+                 SURVEYOR_SLUG, (unsigned long)s_seq, part, (long long)time(nullptr),
+                 (unsigned long)s_seq, lat, lon, alt, hdop, sats, fix ? 1 : 0,
+                 part, parts, rf);
+        if (hlen >= PROBE_HDR_MAX) {
+            // Drop the RF fields rather than overrun the peek window — see PROBE_HDR_MAX.
+            snprintf(hdr, sizeof(hdr),
                  "{\"kind\":\"probe\",\"camera\":\"%s\",\"event_id\":\"prb-%lu-%u\","
                  "\"captured_at\":%lld,\"seq\":%lu,\"lat\":%.6f,\"lon\":%.6f,"
                  "\"alt\":%.1f,\"hdop\":%.2f,\"sats\":%u,\"fix\":%d,"
@@ -326,9 +374,11 @@ static void probe(bool big) {
                  SURVEYOR_SLUG, (unsigned long)s_seq, part, (long long)time(nullptr),
                  (unsigned long)s_seq, lat, lon, alt, hdop, sats, fix ? 1 : 0,
                  part, parts);
+            Serial.printf("[probe] header %d B > %d — leaf RF dropped\n",
+                          hlen, PROBE_HDR_MAX);
+        }
 
-        const uint32_t t0 = millis();
-        const bool ok = sv_probe_send(hdr, body, bytes, probe_timeout_ms(bytes));
+        const bool ok = linked && sv_probe_send(hdr, body, bytes, probe_timeout_ms(bytes));
         const uint32_t ms = millis() - t0;
         all_ok = all_ok && ok;
         s_try_count++;

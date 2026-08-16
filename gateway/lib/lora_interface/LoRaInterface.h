@@ -113,7 +113,27 @@ private:
 
 	// Radio parameters (RadioLib units: MHz, kHz). SF/BW/CR come from the profile
 	// table (lora_profiles.h) and are runtime-switchable via set_profile().
-	const float frequency = 915.0;   // MHz
+#ifndef LORA_FREQ_MHZ
+#define LORA_FREQ_MHZ 903.0          // MHz — MUST sit on the RAK3172 grant's channel
+	                                 // set: the LoRaWAN US915 500 kHz uplink grid,
+	                                 // 903.0 + 1.6*n, i.e. 903.0 904.6 906.2 907.8
+	                                 // 909.4 911.0 912.6 914.2 (homelab
+	                                 // docs/trailcam/fcc-certification.md Finding 3d,
+	                                 // window 903–914.2).
+	                                 //
+	                                 // WAS 915.0 until 2026-08-07 — entirely OUTSIDE
+	                                 // that window, i.e. the fleet was not in the
+	                                 // certified band. Found during the bench
+	                                 // spike (leaf-v1.0-respin-spec.md §0a).
+	                                 //
+	                                 // NOT 903.9: that is RUI3's P2P default and what
+	                                 // the bench interop ran on, but it is on the
+	                                 // 125 kHz grid, not a granted centre. Bench only.
+	                                 //
+	                                 // ⚠️ CHANGING THIS IS A FLAG DAY — every node must
+	                                 // be reflashed together or they are mutually deaf.
+#endif
+	const float frequency = LORA_FREQ_MHZ;   // MHz
 	float       bandwidth = LORA_PROFILES[LORA_PROFILE_BASE].bw_khz;
 	int         spreading = LORA_PROFILES[LORA_PROFILE_BASE].sf;
 	int         coding    = LORA_PROFILES[LORA_PROFILE_BASE].cr;

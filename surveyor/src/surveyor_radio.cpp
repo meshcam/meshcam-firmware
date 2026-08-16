@@ -121,7 +121,26 @@ static void gw_load_candidates() {
     p.begin(NVS_NS, true);
     String last = p.getString("gw", "");
     p.end();
-    if (last.length() == 32) gw_promote(last.c_str());   // last winner probes first
+    // The cached winner probes first, but ONLY if it is a CONFIGURED candidate.
+    // Found in the field 2026-08-07: the cache is written on whatever mesh
+    // last answered, so a surveyor carried from the home bench to another site boots
+    // with the HOME gateway inserted at the head of the ladder — outranking the gateway
+    // it is physically standing under. try_link_on_current_profile() then takes the
+    // first candidate has_path() accepts, and a PERSISTED path entry answers with zero
+    // RF, so every probe opens a link to a gateway tens of miles away and dies. Symptom
+    // is brutal to read in the field: announces arrive at the real gateway (broadcast,
+    // no link needed) while res ok/fail never moves. Observed at the north40 site with
+    // gw=6d3d3467(?) and ok=0/3 at -79 dBm.
+    if (last.length() == 32) {
+        bool configured = false;
+        for (int i = 0; i < s_gw_n; i++)
+            if (strcasecmp(s_gw_cands[i], last.c_str()) == 0) { configured = true; break; }
+        if (configured)
+            gw_promote(last.c_str());
+        else
+            Serial.printf("[gw-disc] cached winner %.8s is not a configured candidate "
+                          "-> IGNORED (stale cross-site cache)\n", last.c_str());
+    }
     Serial.printf("[gw-disc] %d gateway candidate(s), first %.8s\n",
                   s_gw_n, s_gw_n ? s_gw_cands[0] : "-");
 }
@@ -146,6 +165,14 @@ public:
 const char* sv_gateway_short() {
     static char s[10];
     if (!s_gw_n) return "--------";
+    // Never render a hash we have not PROVEN. Until a link forms,
+    // s_gw_cands[0] is only the head of a guess-ladder. Printing it like a live reading
+    // invented an entire phantom finding ("the tower rotated its identity") and
+    // then cost an hour of field time on 2026-08-07, because the sole tell that it was
+    // unproven was a "(?)" that a human dropped when transcribing it. Dashes cannot be
+    // misread. The candidate actually being attempted is still in the serial trace
+    // ("requesting path to gateway ..."), which is where a diagnosis belongs.
+    if (!s_gw_known) return "--------";
     snprintf(s, sizeof(s), "%.8s", s_gw_cands[0]);
     return s;
 }
@@ -281,16 +308,33 @@ static bool try_link_on_current_profile(RNS::Bytes* hashes, uint32_t path_ms,
 // other rung of the shared ladder; a formed link means we stay there (the gateway
 // serves multiple identities on one profile; ADR keepalives take over). Total failure
 // converges back to base, mirroring the rendezvous rule.
+//
+// The scan is confined to the rendezvous PROFILE FAMILY (the surveyor half).
+// Since the certified bw500 ladder was appended as idx 3-5, "every other rung" stopped
+// meaning "every rung a gateway could be on": a bw500 node and a bw125 node are
+// mutually deaf, so probing the other family cannot find anything the fleet is
+// reachable on — it is not merely slower, it is futile. And it is expensive at exactly
+// the wrong moment, because the far rungs carry the longest airtime: measured
+// 2026-08-08, probe #104 spent 235 s failing over the full six-rung ladder against
+// probe #106's 17.8 s to a clean link. On a range walk that turns a 20-second probe
+// into a four-minute one at precisely the marginal spots the walk exists to measure.
+// Crossing families is a flag day (both ends reflashed together), never a scan step.
+#define SV_RF_FAMILY_MIN ((uint8_t)(LORA_PROFILE_BASE <= 2 ? 0 : 3))
+#define SV_RF_FAMILY_MAX ((uint8_t)(LORA_PROFILE_BASE <= 2 ? 2 : LORA_PROFILE_COUNT - 1))
+
 static bool establish_gateway_link() {
     if (s_gw_link && s_gw_link_up) return true;
     if (!s_gw_n) { Serial.println("[radio] no gateway candidates at all"); return false; }
     RNS::Bytes hashes[SV_GW_MAX];
     for (int i = 0; i < s_gw_n; i++) hashes[i].assignHex(s_gw_cands[i]);
 
+    // Current profile first (it is where we already are), then the rest of ITS family.
+    // Keeping order[0] unconditional matters: a stale off-family grant can leave us
+    // outside the family, and that rung is still the most likely one to answer.
     uint8_t order[LORA_PROFILE_COUNT];
     int n = 0;
     order[n++] = sv_radio_profile();
-    for (uint8_t p = 0; p < LORA_PROFILE_COUNT; p++)
+    for (uint8_t p = SV_RF_FAMILY_MIN; p <= SV_RF_FAMILY_MAX; p++)
         if (p != order[0]) order[n++] = p;
 
     for (int oi = 0; oi < n; oi++) {
@@ -308,6 +352,11 @@ static bool establish_gateway_link() {
     if (sv_radio_profile() != LORA_PROFILE_BASE)
         sv_radio_set_profile(LORA_PROFILE_BASE);
     return false;
+}
+
+bool sv_link_ensure() {
+    if (!s_up || !s_radio) return false;
+    return establish_gateway_link();
 }
 
 void sv_link_teardown() {
