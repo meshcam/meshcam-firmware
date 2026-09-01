@@ -241,7 +241,13 @@ UDPInterface::UDPInterface(const char* name /*= "UDPInterface"*/) : RNS::Interfa
 #ifdef ARDUINO
 			udp.beginPacket(_remote_host.c_str(), _remote_port);
 			udp.write(data.data(), data.size());
-			udp.endPacket();
+			// endPacket() returns 1 on success, 0 on failure (NetworkUDP::endPacket()) —
+			// check it like the POSIX branch below checks sendto(), instead of reporting
+			// every send as successful regardless of what lwIP actually did.
+			if (!udp.endPacket()) {
+				WARNINGF("Failed sending %d bytes to %s:%d", (int)data.size(), _remote_host.c_str(), _remote_port);
+				success = false;
+			}
 #else
 			TRACEF("Sending UDP packet to %s:%d", _remote_host.c_str(), _remote_port);
 			sockaddr_in sock_addr;

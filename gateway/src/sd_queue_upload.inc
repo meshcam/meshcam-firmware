@@ -70,6 +70,39 @@ private:
 // UP_OK / UP_DROP = stop holding the frame, UP_RETRY = keep it and come back later.
 enum UploadOutcome { UP_RETRY = 0, UP_OK, UP_DROP };
 
+// Which HTTP codes mean THIS FRAME is unsendable, as opposed to "the server or the path
+// is unhappy right now". Only the first kind may be dropped: a dropped frame is deleted
+// from the card AND has its custody revoked, so the leaf will never re-send it either.
+//
+// This is an ALLOWLIST on purpose. It used to be "any 4xx is permanent", which made a
+// rotated or mistyped device token (ingest answers 401 "Unknown token" — verified against
+// trailcam-dev, 2026-08-29) delete every frame in the queue as fast as it could POST them,
+// with all three ends believing someone else had the photo. Auth, rate limiting and
+// timeouts are outages, and outages are what this queue exists to survive.
+//   400  malformed request
+//   413  body too large -- it will be too large next time too
+//   415  unsupported media type
+//   422  ingest's own validation: bad kind, bad meta, empty file
+// Everything else -- 401/403/404/408/429, every 5xx, every transport error -- keeps the
+// frame and retries, which is safe because ingest is idempotent per (event_id, kind).
+//
+// constexpr so the static_asserts below travel with it: the leaf gates inject the
+// OUTCOME, so this code->outcome mapping is the one part of the drain no hardware gate
+// can reach. The asserts are the test, and every build of every target runs them.
+constexpr bool upload_code_is_permanent(int code) {
+    return code == 400 || code == 413 || code == 415 || code == 422;
+}
+
+static_assert(upload_code_is_permanent(422), "422 (bad kind/meta/empty) must drop");
+static_assert(upload_code_is_permanent(400), "400 must drop");
+static_assert(!upload_code_is_permanent(401), "401 is a ROTATED TOKEN, never drop a frame");
+static_assert(!upload_code_is_permanent(403), "403 is an auth/policy outage, never drop");
+static_assert(!upload_code_is_permanent(429), "429 is rate limiting, never drop");
+static_assert(!upload_code_is_permanent(408), "408 is a timeout, never drop");
+static_assert(!upload_code_is_permanent(404), "404 is a misrouted deploy, never drop");
+static_assert(!upload_code_is_permanent(500) && !upload_code_is_permanent(502),
+              "5xx is the server's problem, never drop");
+
 static UploadOutcome upload_body(const char* eid, const char* cam, const char* kind,
                                  long long captured_at, const uint8_t* buf, File* f,
                                  size_t len) {
@@ -119,8 +152,8 @@ static UploadOutcome upload_body(const char* eid, const char* cam, const char* k
                       eid, kind, (unsigned)len, code, ok ? "" : " (will retry)");
         if (ok) s_stats.uploads_ok++;
         log_event("upload %s %s -> HTTP %d", eid, kind, code);
-        if (!ok && code >= 400 && code < 500) {
-            Serial.printf("[gw] 4xx is permanent -> dropping: %s\n",
+        if (!ok && upload_code_is_permanent(code)) {
+            Serial.printf("[gw] HTTP %d is permanent -> dropping: %s\n", code,
                           http.getString().substring(0, 200).c_str());
             out = UP_DROP;   // retrying a malformed frame forever helps nobody
         }

@@ -46,7 +46,10 @@ static bool camera_init_full() {
     c.pin_d7 = CAM_PIN_D7; c.pin_d6 = CAM_PIN_D6; c.pin_d5 = CAM_PIN_D5; c.pin_d4 = CAM_PIN_D4;
     c.pin_d3 = CAM_PIN_D3; c.pin_d2 = CAM_PIN_D2; c.pin_d1 = CAM_PIN_D1; c.pin_d0 = CAM_PIN_D0;
     c.pin_vsync = CAM_PIN_VSYNC; c.pin_href = CAM_PIN_HREF; c.pin_pclk = CAM_PIN_PCLK;
-    c.xclk_freq_hz = 20000000;
+#ifndef LEAF_CAM_XCLK_HZ
+#define LEAF_CAM_XCLK_HZ 20000000
+#endif
+    c.xclk_freq_hz = LEAF_CAM_XCLK_HZ;   // bench override: 10 MHz cuts sensor draw at full-res
     c.ledc_timer = LEDC_TIMER_0; c.ledc_channel = LEDC_CHANNEL_0;
     c.pixel_format = PIXFORMAT_JPEG;
     // Init at the LARGEST size we'll grab: the driver sizes the framebuffer from this,
@@ -68,6 +71,16 @@ static bool camera_init_full() {
 static bool set_mode(framesize_t size, int quality, int settle) {
     sensor_t* s = esp_camera_sensor_get();
     if (!s) return false;
+    // Clamp to what THIS sensor can do. LEAF_FULL_FRAMESIZE is the OV3660's QXGA; an
+    // OV2640 (UXGA max) given QXGA programs a window it cannot fill and fb_get() returns
+    // null — seen 2026-08-17 on the first leaf-PCB capture ("full grab EMPTY"), so the
+    // thumb went out and nothing was stored. esp_camera_init() already clamps its own
+    // framebuffer allocation the same way; this keeps the mode switch consistent with it.
+    camera_sensor_info_t* info = esp_camera_sensor_get_info(&s->id);
+    if (info && size > info->max_size) {
+        Serial.printf("[cam] framesize %d > sensor max %d -> clamped\n", (int)size, (int)info->max_size);
+        size = info->max_size;
+    }
     s->set_framesize(s, size);
     if (s->set_quality) s->set_quality(s, quality);
     for (int i = 0; i < settle; i++) {

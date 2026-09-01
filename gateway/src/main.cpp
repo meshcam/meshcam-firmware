@@ -28,6 +28,13 @@
  * reticulum.loop() would stall the radio for seconds).
  */
 
+// GENERATED + gitignored (gen_gw_secrets.py, from secrets.ini). WiFi creds, ingest
+// URL/token, OTA password. A header rather than -D flags on the build command line:
+// as flags they were readable by any user via ps and got echoed verbatim by a
+// compiler error on the leaf side on 2026-08-09. Must come before the
+// #error guards below, which test these macros.
+#include "gw_secrets.h"
+
 #include <microStore/FileSystem.h>
 #include <microStore/Adapters/UniversalFileSystem.h>
 #include <LoRaInterface.h>
@@ -42,9 +49,20 @@
 #ifdef GW_HAS_OLED
 #include <U8g2lib.h>        // SSD1306 OLED (parent-facing status screen)
 #endif
-#ifdef GW_NET_ETH
-#include <ETH.h>            // LAN8720 wired ethernet (LILYGO T-Internet-POE)
-#include <esp_task_wdt.h>   // un-watch IDLE0 while the SD mount probe may busy-spin
+// Wired-ethernet uplink comes in two flavours, one firmware:
+//   GW_NET_ETH        — LAN8720 RMII (LILYGO T-Internet-POE), classic core-2.x ETH API.
+//   GW_NET_ETH_W5500  — WIZnet W5500 over SPI (production gateway PCB), core-3.x ETH API.
+// Everything above the netif is identical, so GW_NET_HAS_ETH gates the shared plumbing.
+#if defined(GW_NET_ETH) || defined(GW_NET_ETH_W5500)
+#define GW_NET_HAS_ETH
+#endif
+// WiFi is compiled in either because it is the ONLY uplink (Heltec) or because the build
+// asked for the runtime dual stack (GW_NET_DUALSTACK, the production S3 gateway PCB).
+#if !defined(GW_NET_HAS_ETH) || defined(GW_NET_DUALSTACK)
+#define GW_NET_HAS_WIFI
+#endif
+#ifdef GW_NET_HAS_ETH
+#include <ETH.h>            // wired ethernet (LAN8720 RMII or W5500 SPI)
 #include <UDPInterface.h>   // vendored (lib/udp_interface): RNS-over-UDP on the wire
 #endif
 #include <ArduinoOTA.h>     // network firmware updates (espota) over the WG tunnel
@@ -53,7 +71,7 @@
 #define GW_SITE "home"
 #endif
 #ifndef GW_FW_VERSION
-#define GW_FW_VERSION "gateway-0.15.0"
+#define GW_FW_VERSION "gateway-0.15.1"
 #endif
 #ifndef GW_VIEW_HOST
 #define GW_VIEW_HOST "trailcam.example.com"   // family gallery shown on the OLED
@@ -64,25 +82,80 @@
 #if !defined(GW_INGEST_URL) || !defined(GW_INGEST_TOKEN)
 #error "GW_INGEST_URL / GW_INGEST_TOKEN required — see secrets.ini.example"
 #endif
-#if !defined(GW_NET_ETH) && (!defined(GW_WIFI_SSID) || !defined(GW_WIFI_PSK))
+#if !defined(GW_NET_HAS_ETH) && !defined(GW_NET_HAS_WIFI)
+#error "no uplink compiled in — define GW_NET_ETH, GW_NET_ETH_W5500 and/or GW_NET_DUALSTACK"
+#endif
+// A WiFi-ONLY build has nowhere to get credentials from, so baked ones are mandatory. A
+// dual-stack build may legitimately ship with none: ethernet needs no creds and the WiFi
+// half is provisioned in the field (see net_creds_* below).
+#if defined(GW_NET_HAS_WIFI) && !defined(GW_NET_HAS_ETH) && \
+    (!defined(GW_WIFI_SSID) || !defined(GW_WIFI_PSK))
 #error "GW_WIFI_SSID / GW_WIFI_PSK required for the WiFi build — see secrets.ini.example"
 #endif
 
-// --- network abstraction: the uplink is WiFi (Heltec) or wired ethernet (T-Internet-POE).
-// Everything below the transport (TLS ingest, OTA, NTP, web server) is identical — lwIP
-// doesn't care which interface carries the socket.
-#ifdef GW_NET_ETH
-static volatile bool s_eth_got_ip = false;
-static bool net_up()  { return s_eth_got_ip; }
-static IPAddress net_ip()   { return ETH.localIP(); }
-static int    net_rssi()    { return 0; }              // wired: no meaningful RSSI
-static String net_desc()    { return String("ethernet ") + (s_eth_got_ip ? ETH.linkSpeed() : 0) + "M"; }
-#else
-static bool net_up()  { return WiFi.status() == WL_CONNECTED; }
-static IPAddress net_ip()   { return WiFi.localIP(); }
-static int    net_rssi()    { return (int)WiFi.RSSI(); }
-static String net_desc()    { return WiFi.SSID(); }
+// --- network abstraction ----------------------------------------------------------------
+// The uplink is wired ethernet (T-Internet-POE tower), WiFi (Heltec), or — on the
+// production S3 gateway PCB — BOTH, with the box choosing at RUNTIME. One SKU has to cover
+// "window unit on the household WiFi" and "sealed mast unit on PoE", so transport cannot be
+// a compile-time fact any more.
+//
+// What IS still compile-time is which interfaces physically exist (a Heltec has no PHY; the
+// T-Internet-POE's WiFi is unused). What is runtime is WHICH ONE IS CARRYING TRAFFIC. On a
+// single-transport build the state machine in net_ensure() collapses to exactly the old
+// behaviour — the only interface either comes up or doesn't.
+//
+// Nothing above the netif changes: TLS ingest, OTA, NTP, RNS-over-UDP and the web server
+// all ride lwIP, which does not care which interface owns the route. All any of them needs
+// is these four accessors answering for whichever interface is active right now.
+enum NetIface : uint8_t { NET_IFACE_NONE = 0, NET_IFACE_ETH, NET_IFACE_WIFI };
+static volatile NetIface s_net_active = NET_IFACE_NONE;
+#ifdef GW_NET_HAS_ETH
+static volatile bool s_eth_got_ip = false;   // set from the link-event callback
 #endif
+
+static bool net_up() {
+    switch (s_net_active) {
+#ifdef GW_NET_HAS_ETH
+        case NET_IFACE_ETH:  return s_eth_got_ip;
+#endif
+#ifdef GW_NET_HAS_WIFI
+        case NET_IFACE_WIFI: return WiFi.status() == WL_CONNECTED;
+#endif
+        default: return false;
+    }
+}
+static IPAddress net_ip() {
+    switch (s_net_active) {
+#ifdef GW_NET_HAS_ETH
+        case NET_IFACE_ETH:  return ETH.localIP();
+#endif
+#ifdef GW_NET_HAS_WIFI
+        case NET_IFACE_WIFI: return WiFi.localIP();
+#endif
+        default: return IPAddress((uint32_t)0);
+    }
+}
+// Wired has no meaningful RSSI. 0 is deliberate rather than a sentinel: it reads as
+// "full signal" to draw_wifi_icon()'s thresholds, which is the truthful rendering.
+static int net_rssi() {
+#ifdef GW_NET_HAS_WIFI
+    if (s_net_active == NET_IFACE_WIFI) return (int)WiFi.RSSI();
+#endif
+    return 0;
+}
+// Goes out in the health beat's extra.wifi_ssid, so it must say WHICH uplink is live —
+// that field is how a remote gateway's transport is diagnosed without a serial cable.
+static String net_desc() {
+    switch (s_net_active) {
+#ifdef GW_NET_HAS_ETH
+        case NET_IFACE_ETH:  return String("ethernet ") + (s_eth_got_ip ? ETH.linkSpeed() : 0) + "M";
+#endif
+#ifdef GW_NET_HAS_WIFI
+        case NET_IFACE_WIFI: return WiFi.SSID();
+#endif
+        default: return String("down");
+    }
+}
 
 static const char* APP_NAME = "trailcam_gatea";   // leaves build their OUT destination
 static const char* ASPECT   = "resource";         // from these exact strings — don't drift
@@ -92,8 +165,9 @@ static const char* ASPECT   = "resource";         // from these exact strings �
 static RNS::Reticulum reticulum({RNS::Type::NONE});
 static RNS::Interface lora_interface({RNS::Type::NONE});
 static bool s_radio_ok = false;   // SX1262 present + init'd; false = ethernet/WiFi-only boot
-#ifdef GW_NET_ETH
+#ifdef GW_NET_HAS_ETH
 static RNS::Interface udp_interface({RNS::Type::NONE});   // RNS-over-UDP on the wire
+static bool s_udp_started = false;   // has udp_interface.start() ever run?
 #endif
 static microStore::FileSystem filesystem{microStore::Adapters::UniversalFileSystem()};
 static RNS::Destination gw_destination({RNS::Type::NONE});
@@ -347,7 +421,7 @@ static void have_unnote(const char* eid, const char* kind);
 //     half-frame that uploads as garbage.
 //   * drain NEWEST-FIRST, thumb before full at equal capture time (the ingest API's own
 //     thumb-first/full-later philosophy), older frames backfilled behind. Delete ONLY
-//     after a 2xx; 4xx stays permanent -> drop. Ingest is idempotent per
+//     after a 2xx; only a rejected FRAME (400/413/415/422) drops. Ingest is idempotent per
 //     (event_id, kind), so re-sending after an ambiguous failure is safe.
 //   * reboots KEEP the queue. This deliberately REVERSES the old wipe-on-boot: only the
 //     partial assembly (TMP.TMP) is worthless across a reboot, completed frames are not.
@@ -1348,6 +1422,11 @@ public:
         // calibration 2026-07-18) -> extra.tx_dbm, so RSSI rows are attributable to
         // the power that produced them.
         char txkv[24] = "";
+        // Leaf full-res store degraded: "sd=n" no card, "sd=u" a card whose
+        // filesystem would not mount (an out-of-the-package exFAT card — a FAT32 reformat
+        // fixes it, an RMA does not), "sd=?" degraded, cause not separable. The field is
+        // ABSENT on a healthy leaf, so its presence alone is the alarm.
+        char sdkv[24] = "";
         if (htail[0]) {
             long p = -1, c = -1, f = -1;
             float vb = NAN;
@@ -1358,6 +1437,8 @@ public:
             if ((t = strstr(htail, "vb=")))              vb = atof(t + 3);
             if ((t = strstr(htail, "tx=")))
                 snprintf(txkv, sizeof(txkv), ",\"tx_dbm\":%ld", atol(t + 3));
+            if ((t = strstr(htail, "sd=")) && t[3] && t[3] != ' ')
+                snprintf(sdkv, sizeof(sdkv), ",\"sd\":\"%c\"", t[3]);
             // Only leaves that actually sent the health counters get a health object
             // (a tail can now be just "n=<slug> tx=<dbm>").
             if (p >= 0 || c >= 0 || f >= 0) {
@@ -1373,19 +1454,19 @@ public:
         }
         if (isnan(LoRaInterface::last_rssi))
             queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\"%s,"
-                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s%s,"
+                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s%s%s,"
                        "\"packet\":{\"len\":%u,\"hex\":\"%s\"}}}",
                        GW_SITE, L.slug[0] ? L.slug : gw_fallback_camera(), batt, status,
-                       (unsigned)LoRaInterface::last_hops, health, txkv,
+                       (unsigned)LoRaInterface::last_hops, health, txkv, sdkv,
                        (unsigned)LoRaInterface::last_frame_len, hexbuf);
         else
             queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\"%s,"
                        "\"rssi\":%.0f,\"snr\":%.1f,"
-                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s%s,"
+                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s%s%s,"
                        "\"packet\":{\"len\":%u,\"hex\":\"%s\"}}}",
                        GW_SITE, L.slug[0] ? L.slug : gw_fallback_camera(), batt,
                        LoRaInterface::last_rssi, LoRaInterface::last_snr, status,
-                       (unsigned)LoRaInterface::last_hops, health, txkv,
+                       (unsigned)LoRaInterface::last_hops, health, txkv, sdkv,
                        (unsigned)LoRaInterface::last_frame_len, hexbuf);
     }
 };
@@ -1876,19 +1957,35 @@ static void rf_loop() {
     }
 }
 
+#ifdef GW_NET_HAS_ETH
+// --- wired ethernet ---------------------------------------------------------------------
+// The link-event handling is identical for both PHYs (the ETH API abstracts localIP /
+// linkSpeed / fullDuplex); only the ETH.begin bring-up and the event-bus name differ.
+//
+// LAN8720 (T-Internet-POE): classic core-2.x ETH.begin(addr,power,mdc,mdio,type,clk),
+//   events on the WiFi bus, WiFiEvent_t handler. Env pinned to espressif32@6.x.
+// W5500 (production gateway PCB): core-3.x ETH.begin(W5500,addr,cs,int,rst,spi_host,
+//   sck,miso,mosi) over its own SPI3 bus, events on the Network bus, arduino_event_id_t
+//   handler (pioarduino core 3.x). Pin map = gateway PCB GPIO draft, gate-c-proven.
 #ifdef GW_NET_ETH
-// --- wired ethernet (LILYGO T-Internet-POE, LAN8720) ------------------------------------
 // Pin map proven on the bench 2026-06-30 (bridge-poe Step 1): MDC 23, MDIO 18, PHY addr 0,
-// clock OUT on GPIO17, no power-enable pin. Classic Arduino-ESP32 core 2.x ETH API — the
-// env is pinned to espressif32@6.x for exactly this signature.
+// clock OUT on GPIO17, no power-enable pin.
 #define GW_ETH_ADDR        0
 #define GW_ETH_POWER_PIN  -1
 #define GW_ETH_MDC_PIN    23
 #define GW_ETH_MDIO_PIN   18
 #define GW_ETH_TYPE       ETH_PHY_LAN8720
 #define GW_ETH_CLK_MODE   ETH_CLOCK_GPIO17_OUT
+#endif
 
+// Which bus the ETH events arrive on is a CORE-VERSION fact, not a PHY fact: core 3.x moved
+// them from the WiFi event bus to the Network one and renamed the id type. Key off the core
+// version directly so a future core-3.x LAN8720 env (or a core-2.x anything) still compiles.
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+static void on_eth_event(arduino_event_id_t event) {
+#else
 static void on_eth_event(WiFiEvent_t event) {
+#endif
     switch (event) {
         case ARDUINO_EVENT_ETH_START:     Serial.println("[gw] ETH start"); ETH.setHostname("trailcam-gw"); break;
         case ARDUINO_EVENT_ETH_CONNECTED: Serial.println("[gw] ETH link up"); break;
@@ -1904,42 +2001,131 @@ static void on_eth_event(WiFiEvent_t event) {
     }
 }
 
-// Bring-up is event-driven and non-blocking; DHCP renewal/link flaps are the PHY's
-// problem, so the periodic ensure is a no-op (kept for loop() symmetry with WiFi).
-static void net_setup()  { WiFi.onEvent(on_eth_event);   // ETH events ride the WiFi event bus
-                           ETH.begin(GW_ETH_ADDR, GW_ETH_POWER_PIN, GW_ETH_MDC_PIN,
-                                     GW_ETH_MDIO_PIN, GW_ETH_TYPE, GW_ETH_CLK_MODE); }
-static void net_ensure() {}
+// Bring-up is event-driven and non-blocking; DHCP renewal/link flaps are the PHY's problem.
+static void eth_begin() {
+#ifdef GW_NET_ETH_W5500
+    ETH.begin(ETH_PHY_W5500, /*phy_addr=*/1,
+              ETH_CS_PIN, ETH_INT_PIN, ETH_RST_PIN,
+              SPI3_HOST, ETH_SCK_PIN, ETH_MISO_PIN, ETH_MOSI_PIN);
 #else
-// --- WiFi + ingest ---------------------------------------------------------------------
-// Baked network list, tried in order: the site's primary network first, then any fallback
-// (the bench SSID) so the SAME firmware works on-site and on the bench. Add more pairs
-// by defining GW_WIFI_SSID3/PSK3, etc.
+    ETH.begin(GW_ETH_ADDR, GW_ETH_POWER_PIN, GW_ETH_MDC_PIN,
+              GW_ETH_MDIO_PIN, GW_ETH_TYPE, GW_ETH_CLK_MODE);
+#endif
+}
+#endif  // GW_NET_HAS_ETH
+
+#ifdef GW_NET_HAS_WIFI
+// --- WiFi credentials -------------------------------------------------------------------
+// Two sources, tried NVS-first:
+//
+//   NVS (one network, key "wifi" in the "gateway" namespace) — what a provisioned box was
+//     set up on. First because it is a deliberate act by whoever owns the unit, whereas the
+//     baked list is a factory/bench convenience that must never outrank it.
+//   BAKED (GW_WIFI_SSID/PSK, ...SSID2/3) — the site's primary then any fallback, so the
+//     SAME firmware works on-site and on the bench. A shipped consumer build bakes NONE and
+//     relies entirely on provisioning; a dev/bench build bakes the bench SSID and so never
+//     reaches the provisioning path at all.
+//
+// net_creds_save() is the single seam every provisioning front-end writes through — captive
+// portal, mesh config downlink, or serial/QR at kitting all end here. Which of those ships
+// is still open; see homelab docs/trailcam/gateway-provisioning.md.
 struct WifiCred { const char* ssid; const char* psk; };
-static const WifiCred WIFI_NETS[] = {
+static const WifiCred WIFI_BAKED[] = {
+#if defined(GW_WIFI_SSID) && defined(GW_WIFI_PSK)
     { GW_WIFI_SSID,  GW_WIFI_PSK  },
+#endif
 #if defined(GW_WIFI_SSID2) && defined(GW_WIFI_PSK2)
     { GW_WIFI_SSID2, GW_WIFI_PSK2 },
 #endif
 #if defined(GW_WIFI_SSID3) && defined(GW_WIFI_PSK3)
     { GW_WIFI_SSID3, GW_WIFI_PSK3 },
 #endif
-};
-static const size_t WIFI_NET_COUNT = sizeof(WIFI_NETS) / sizeof(WIFI_NETS[0]);
+    { nullptr, nullptr },   // terminator: a zero-length array is illegal, and a consumer
+};                          // build legitimately bakes nothing at all
+static const size_t WIFI_BAKED_COUNT = (sizeof(WIFI_BAKED) / sizeof(WIFI_BAKED[0])) - 1;
+
+static char s_nvs_ssid[33] = "";    // 32 + NUL
+static char s_nvs_psk[64]  = "";    // WPA2 PSK max 63 + NUL
+
+static void net_creds_load() {
+    Preferences p;
+    p.begin("gateway", /*readOnly=*/true);
+    p.getString("wifi_ssid", s_nvs_ssid, sizeof(s_nvs_ssid));
+    p.getString("wifi_psk",  s_nvs_psk,  sizeof(s_nvs_psk));
+    p.end();
+    if (s_nvs_ssid[0]) Serial.printf("[gw] provisioned WiFi network: \"%s\"\n", s_nvs_ssid);
+}
+// Returns false and changes nothing on a malformed SSID — a provisioning front-end must be
+// able to reject bad input without having already clobbered a working credential.
+//
+// This is the sink EVERY provisioning option writes through — the serial console below is
+// the first one; a SoftAP captive portal would land here too. Nothing about the
+// selector changes when another front-end is added.
+static bool net_creds_save(const char* ssid, const char* psk) {
+    if (!ssid || !ssid[0] || strlen(ssid) >= sizeof(s_nvs_ssid)) return false;
+    if (!psk  || strlen(psk) >= sizeof(s_nvs_psk)) return false;
+    Preferences p;
+    p.begin("gateway", /*readOnly=*/false);
+    p.putString("wifi_ssid", ssid);
+    p.putString("wifi_psk",  psk);
+    p.end();
+    strlcpy(s_nvs_ssid, ssid, sizeof(s_nvs_ssid));
+    strlcpy(s_nvs_psk,  psk,  sizeof(s_nvs_psk));
+    Serial.printf("[gw] WiFi credential stored for \"%s\"\n", ssid);
+    return true;
+}
+// Forget the provisioned network and fall back to whatever is baked in. Deliberately does
+// NOT touch a live association: if we are currently up on this credential, tearing the
+// uplink down the instant it is erased would take the box off the air with no warning.
+// The next re-selection (a link drop, or a reboot) is soon enough.
+static void net_creds_clear() {
+    Preferences p;
+    p.begin("gateway", /*readOnly=*/false);
+    p.remove("wifi_ssid");
+    p.remove("wifi_psk");
+    p.end();
+    s_nvs_ssid[0] = 0;
+    s_nvs_psk[0]  = 0;
+    Serial.println("[gw] provisioned WiFi credential erased");
+}
+static size_t net_cred_count() { return WIFI_BAKED_COUNT + (s_nvs_ssid[0] ? 1 : 0); }
+// Bounds-safe on purpose: s_wifi_idx is a rotation cursor that outlives the list it points
+// into (a save or clear changes the count under it), and the OLED reads it on its own
+// schedule, before wifi_ensure() next gets a chance to clamp. Out of range returns the
+// array terminator — a {nullptr,nullptr} that callers already have to handle — rather than
+// reading past the end.
+static WifiCred net_cred_at(size_t i) {
+    if (i >= net_cred_count()) return WifiCred{ nullptr, nullptr };
+    if (s_nvs_ssid[0]) {
+        if (i == 0) return WifiCred{ s_nvs_ssid, s_nvs_psk };
+        i--;
+    }
+    return WIFI_BAKED[i];
+}
+
 static size_t s_wifi_idx = 0;   // which network we're currently attempting
 
 #define GW_WIFI_TRY_MS 15000    // per-network association window before rotating
 
+// File-scope rather than a local static inside wifi_ensure() so net_creds_changed() can
+// zero it: a credential that just arrived should be tried NOW, not after the remainder of
+// the previous network's 15 s window. Somebody typing a password at a serial console and
+// watching nothing happen for 15 s will reasonably conclude it did not take.
+static uint32_t s_wifi_last_try = 0;
+
 static void wifi_ensure() {
     if (WiFi.status() == WL_CONNECTED) return;
-    static uint32_t last_try = 0;
-    if (last_try && millis() - last_try < GW_WIFI_TRY_MS) return;
+    const size_t n_nets = net_cred_count();
+    if (n_nets == 0) return;
+    if (s_wifi_last_try && millis() - s_wifi_last_try < GW_WIFI_TRY_MS) return;
     // The current network didn't associate in its window -> rotate to the next one.
-    if (last_try && WIFI_NET_COUNT > 1) s_wifi_idx = (s_wifi_idx + 1) % WIFI_NET_COUNT;
-    last_try = millis();
-    const WifiCred& n = WIFI_NETS[s_wifi_idx];
+    if (s_wifi_last_try && n_nets > 1) s_wifi_idx = (s_wifi_idx + 1) % n_nets;
+    if (s_wifi_idx >= n_nets) s_wifi_idx = 0;   // a save/clear can shrink the list under us
+    s_wifi_last_try = millis();
+    const WifiCred n = net_cred_at(s_wifi_idx);
+    if (!n.ssid) return;   // cannot happen: n_nets > 0 and s_wifi_idx was just clamped
     Serial.printf("[gw] WiFi joining \"%s\" (net %u/%u) ...\n",
-                  n.ssid, (unsigned)(s_wifi_idx + 1), (unsigned)WIFI_NET_COUNT);
+                  n.ssid, (unsigned)(s_wifi_idx + 1), (unsigned)n_nets);
     // Clear any in-flight association before (re)configuring. Without this the
     // multi-network fallback wedges: when the current network is out of range the STA
     // sits in "connecting", and the next WiFi.begin() (this call, for the NEXT network)
@@ -1948,13 +2134,341 @@ static void wifi_ensure() {
     // then never gets online (2026-07-21: took GW-HOME down after an OTA reboot at a
     // site where only net-2 was in range). disconnect(true) drops the radio and clears
     // that state; mode()+begin() below bring it back up fresh on the chosen network.
-    WiFi.disconnect(true);
+    // On the very first call the WiFi driver has never been brought up (dual-stack
+    // defers it to WAIT_WIFI, see above), so there is no in-flight association yet to
+    // clear — disconnect(true) there only logs a spurious ESP_ERR_WIFI_NOT_INIT. Skip it
+    // ONCE; every later call, including the very next rotation, still runs it.
+    static bool s_wifi_driver_up = false;
+    if (s_wifi_driver_up) WiFi.disconnect(true);
     WiFi.mode(WIFI_STA);
     WiFi.begin(n.ssid, n.psk);
+    s_wifi_driver_up = true;
 }
-static void net_setup()  { wifi_ensure(); }
-static void net_ensure() { wifi_ensure(); }
+#endif  // GW_NET_HAS_WIFI
+
+// --- uplink selector --------------------------------------------------------------------
+// Ethernet is PREFERRED whenever it is available: no credentials, no support surface, no
+// airtime, and it is the tower pattern. WiFi is the fallback that makes a window-mounted
+// consumer unit possible on the same SKU. The full state machine and the reasoning behind
+// it are in homelab docs/trailcam/gateway-pcb.md.
+//
+//   WAIT_ETH   bounded window (GW_ETH_PRIMARY_MS) for link+DHCP before spending anything
+//              on WiFi. On an ethernet-only build this is simply where the box waits.
+//   WAIT_WIFI  rotate the credential list; ethernet coming up late still preempts.
+//   UP         active interface serves every socket; on loss, re-select from the top.
+//   PROVISION  no ethernet and no usable credential — nothing to try. The provisioning
+//              front-end is NOT chosen yet, so this state currently only reports itself.
+//
+// DEVIATION from the drafted state machine, deliberate: WiFi is not registered at boot,
+// only when the box actually enters WAIT_WIFI. The draft brought the STA up early and left
+// it idle. Deferring it keeps the WiFi PA and its ~40 kB of heap out of the common
+// ethernet-only path entirely, which is also the cheap answer to the drafted coexistence
+// question (a tower unit never has WiFi and the radio live at the same time). The cost is
+// that the first fallback association starts ~100 ms later, on a path already budgeted 12 s.
+enum NetState : uint8_t { NET_ST_WAIT_ETH, NET_ST_WAIT_WIFI, NET_ST_UP, NET_ST_PROVISION };
+static NetState s_net_state = NET_ST_WAIT_ETH;
+static uint32_t s_net_t0    = 0;    // when the current wait window started
+
+#ifndef GW_ETH_PRIMARY_MS
+#define GW_ETH_PRIMARY_MS 12000     // link + DHCP on a cold switch port fits well inside this
 #endif
+
+#if defined(GW_NET_HAS_ETH) && defined(GW_NET_HAS_WIFI)
+static bool s_eth_ever_up = false;  // has this box EVER had a wired lease?
+#endif
+
+// Where re-selection starts after losing the active interface. Only pay the ethernet
+// window again if ethernet has actually worked here before — on a WiFi-only box, or a
+// dual-stack box with nothing plugged in, that window is 12 s of dead air on every blip.
+// Skipping it is safe because the preempt check at the top of net_ensure() runs in EVERY
+// state, so a late link is never missed regardless of where selection resumes.
+static void net_select_restart() {
+    s_net_t0 = millis();
+#ifdef GW_NET_HAS_ETH
+#ifdef GW_NET_HAS_WIFI
+    s_net_state = s_eth_ever_up ? NET_ST_WAIT_ETH : NET_ST_WAIT_WIFI;
+#else
+    s_net_state = NET_ST_WAIT_ETH;
+#endif
+#else
+    s_net_state = NET_ST_WAIT_WIFI;
+#endif
+}
+
+static void net_ensure();   // net_setup runs one tick immediately
+
+static void net_setup() {
+#ifdef GW_NET_HAS_WIFI
+    net_creds_load();
+#endif
+#ifdef GW_NET_HAS_ETH
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+    Network.onEvent(on_eth_event);   // core-3.x: ETH events ride the Network event bus
+#else
+    WiFi.onEvent(on_eth_event);      // core-2.x: ETH events ride the WiFi event bus
+#endif
+    eth_begin();
+    s_net_state = NET_ST_WAIT_ETH;
+#else
+    s_net_state = NET_ST_WAIT_WIFI;
+#endif
+    s_net_t0 = millis();
+    net_ensure();   // a WiFi-only box associates immediately, exactly as it always has
+}
+
+static void net_ensure() {
+#ifdef GW_NET_HAS_ETH
+    // Ethernet PREEMPTS in every state: it is strictly cheaper than WiFi, so a link that
+    // shows up late (switch finished booting, someone plugged the cable in) takes over.
+    if (s_eth_got_ip && s_net_active != NET_IFACE_ETH) {
+#ifdef GW_NET_HAS_WIFI
+        s_eth_ever_up = true;
+        if (s_net_active == NET_IFACE_WIFI) {
+            Serial.println("[gw] ethernet link up — preempting WiFi");
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+        }
+#endif
+        s_net_active = NET_IFACE_ETH;
+        s_net_state  = NET_ST_UP;
+        // The preempt path is a seamless interface switch: net_up() was already true
+        // (WiFi) and stays true (now ETH), so it never edge-triggers loop()'s net_was_up
+        // check — which is where the mesh-bridge resume normally lives. Re-arm
+        // directly here instead: reaching this line already means "just became ETH", so
+        // it is always correct to resume when the bridge was running before the outage.
+        // Gap found on the gate-C bench rig 2026-08-20 cable-pull retest: an
+        // ETH -> WiFi -> ETH cycle left the bridge stopped forever after landing the ETH
+        // gate on the WiFi-side resume (the bug that gate fixed had been masking this —
+        // the ungated resume used to fire on the WiFi leg and leave the socket running).
+        if (s_udp_started) {
+            udp_interface.start();
+            Serial.println("[gw] RNS UDP interface resumed");
+        }
+        return;
+    }
+#endif
+    switch (s_net_state) {
+
+    case NET_ST_WAIT_ETH: {
+        if (millis() - s_net_t0 <= GW_ETH_PRIMARY_MS) break;
+#ifdef GW_NET_HAS_WIFI
+        s_net_t0 = millis();
+        if (net_cred_count() > 0) {
+            Serial.printf("[gw] no wired lease in %u ms — falling back to WiFi\n",
+                          (unsigned)GW_ETH_PRIMARY_MS);
+            s_net_state = NET_ST_WAIT_WIFI;
+            wifi_ensure();
+        } else {
+            s_net_state = NET_ST_PROVISION;
+        }
+#else
+        // Ethernet-only build: there is nothing to fall back to, so keep waiting for the
+        // link event exactly as before. Say so ONCE — a dead PHY used to be silent.
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            Serial.printf("[gw] still no wired lease after %u ms; no WiFi in this build, "
+                          "waiting on the link\n", (unsigned)GW_ETH_PRIMARY_MS);
+        }
+#endif
+        break;
+    }
+
+#ifdef GW_NET_HAS_WIFI
+    case NET_ST_WAIT_WIFI:
+        if (WiFi.status() == WL_CONNECTED) {
+            s_net_active = NET_IFACE_WIFI;
+            s_net_state  = NET_ST_UP;
+            break;
+        }
+        if (net_cred_count() == 0) { s_net_state = NET_ST_PROVISION; s_net_t0 = millis(); break; }
+        wifi_ensure();   // owns its own GW_WIFI_TRY_MS rotation window
+        break;
+
+    case NET_ST_PROVISION: {
+        // Credentials can appear while we sit here (that is the whole point), so re-check
+        // and leave the moment there is something to try.
+        if (net_cred_count() > 0) { s_net_state = NET_ST_WAIT_WIFI; s_net_t0 = millis(); break; }
+        // TODO: start the chosen provisioning front-end here. The credential sink
+        // (net_creds_save) and this state both exist; only the UX is undecided — SoftAP
+        // captive portal vs. mesh config downlink vs. serial/QR at kitting. Options and
+        // recommendation: homelab docs/trailcam/gateway-provisioning.md. Until one lands,
+        // the box says so on a slow beat rather than looking silently wedged.
+        static uint32_t last_nag = 0;
+        if (!last_nag || millis() - last_nag > 30000) {
+            last_nag = millis();
+            Serial.println("[gw] UNPROVISIONED: no wired link and no WiFi credential — "
+                           "no uplink is possible until one is supplied");
+        }
+        break;
+    }
+#endif
+
+    case NET_ST_UP:
+        if (!net_up()) {
+            Serial.printf("[gw] uplink (%s) lost — re-selecting\n", net_desc().c_str());
+#ifdef GW_NET_HAS_ETH
+            // _online tracks the RNS interface's own state, not whether the netif still
+            // has a route — left running here, it keeps firing into a dead netif for the
+            // whole re-selection window ("endPacket(): could not send data: 118
+            // ENETUNREACH"). stop() just clears _online on this build (see
+            // UDPInterface::stop()), so this is cheap and reversible; the up-transition
+            // below re-arms it once a route exists again, wired or WiFi.
+            if (s_udp_started) udp_interface.stop();
+#endif
+            s_net_active = NET_IFACE_NONE;
+            net_select_restart();
+        }
+        break;
+
+    default: break;
+    }
+}
+
+#ifdef GW_NET_HAS_WIFI
+// Call after any change to the credential list. Rewinds the rotation cursor to the new
+// network and clears the retry window so the next net_ensure() tick acts on it, instead of
+// waiting out the remainder of the previous network's 15 s.
+//
+// Only nudges when we are NOT already up: a credential edited from the serial console while
+// the box is happily online must not knock it off the air. The new credential takes effect
+// on the next natural re-selection.
+static void net_creds_changed() {
+    s_wifi_idx      = 0;
+    s_wifi_last_try = 0;
+    if (s_net_state == NET_ST_UP) return;
+    if (net_cred_count() > 0 && s_net_state == NET_ST_PROVISION) {
+        s_net_state = NET_ST_WAIT_WIFI;
+        s_net_t0    = millis();
+    }
+    net_ensure();
+}
+#endif
+
+// --- serial console ---------------------------------------------------------------------
+// The gateway's USB port was output-only until now. This is the smallest line reader that
+// lets a credential be written to a box IN HAND without rebuilding firmware for it — the
+// bench/pilot half of the provisioning question (homelab docs/trailcam/gateway-provisioning.md).
+// It is not the consumer answer; a buyer gets the SoftAP portal, which writes
+// through the same net_creds_save() sink.
+//
+// Commands, one per line:
+//   help                      this list
+//   net                       which uplink is live, selector state, IP
+//   wifi show                 the provisioned SSID (never the PSK)
+//   wifi ssid <rest of line>  stage an SSID
+//   wifi psk <rest of line>   stage a passphrase
+//   wifi save                 commit the staged pair to NVS
+//   wifi clear                forget the provisioned network
+//
+// SSID and PSK take the REST OF THE LINE verbatim, spaces included: both legitimately
+// contain spaces, and a one-shot "wifi set <ssid> <psk>" form cannot express that
+// unambiguously. Staging plus an explicit save is what makes it safe — a half-typed pair
+// never reaches NVS, and net_creds_save() rejects a malformed SSID without clobbering a
+// working credential.
+//
+// NOTHING IS ECHOED, deliberately: a passphrase typed here would otherwise land in every
+// captured monitor log. Turn on local echo in the terminal instead (`pio device monitor
+// --echo`) if you want to see what you are typing.
+//
+// Trust model: physical USB access. Anyone who can reach this port can already reflash the
+// board, so the console grants nothing new — but it still never prints a stored PSK back.
+#define GW_CONSOLE_LINE_MAX 160
+
+static void serial_exec(char* line) {
+    while (*line == ' ') line++;
+    if (!*line) return;
+
+    if (!strcmp(line, "help")) {
+        Serial.println("[gw] commands: help | net"
+#ifdef GW_NET_HAS_WIFI
+                       " | wifi show | wifi ssid <v> | wifi psk <v> | wifi save | wifi clear"
+#endif
+                       );
+        Serial.println("[gw] nothing is echoed; use `pio device monitor --echo` to see typing");
+        return;
+    }
+
+    if (!strcmp(line, "net")) {
+        const char* st = s_net_state == NET_ST_WAIT_ETH  ? "WAIT_ETH"
+                       : s_net_state == NET_ST_WAIT_WIFI ? "WAIT_WIFI"
+                       : s_net_state == NET_ST_UP        ? "UP"
+                       : s_net_state == NET_ST_PROVISION ? "PROVISION" : "?";
+        Serial.printf("[gw] state=%s up=%d iface=%s ip=%s rssi=%d\n",
+                      st, (int)net_up(), net_desc().c_str(),
+                      net_ip().toString().c_str(), net_rssi());
+        return;
+    }
+
+#ifdef GW_NET_HAS_WIFI
+    // Staged until "wifi save" — see the rest-of-line note above.
+    static char stage_ssid[33] = "";
+    static char stage_psk[64]  = "";
+
+    if (!strcmp(line, "wifi show")) {
+        Serial.printf("[gw] provisioned ssid: %s\n", s_nvs_ssid[0] ? s_nvs_ssid : "(none)");
+        Serial.printf("[gw] provisioned psk:  %s\n", s_nvs_psk[0]  ? "(set)"   : "(none)");
+        Serial.printf("[gw] staged ssid: %s  psk: %s\n",
+                      stage_ssid[0] ? stage_ssid : "(none)",
+                      stage_psk[0]  ? "(set)"    : "(none)");
+        Serial.printf("[gw] %u credential(s) in the try list (NVS first, then baked)\n",
+                      (unsigned)net_cred_count());
+        return;
+    }
+    if (!strncmp(line, "wifi ssid ", 10)) {
+        const char* v = line + 10;
+        if (strlen(v) >= sizeof(stage_ssid)) { Serial.println("[gw] ssid too long (max 32)"); return; }
+        strlcpy(stage_ssid, v, sizeof(stage_ssid));
+        Serial.printf("[gw] staged ssid \"%s\" — now `wifi psk <v>` then `wifi save`\n", stage_ssid);
+        return;
+    }
+    if (!strncmp(line, "wifi psk ", 9)) {
+        const char* v = line + 9;
+        if (strlen(v) >= sizeof(stage_psk)) { Serial.println("[gw] psk too long (max 63)"); return; }
+        strlcpy(stage_psk, v, sizeof(stage_psk));
+        Serial.println("[gw] staged psk — now `wifi save`");
+        return;
+    }
+    if (!strcmp(line, "wifi save")) {
+        if (!stage_ssid[0]) { Serial.println("[gw] no staged ssid — `wifi ssid <v>` first"); return; }
+        if (!net_creds_save(stage_ssid, stage_psk)) { Serial.println("[gw] rejected, nothing written"); return; }
+        stage_ssid[0] = 0;
+        stage_psk[0]  = 0;   // don't leave a passphrase sitting in RAM after it is committed
+        net_creds_changed();
+        return;
+    }
+    if (!strcmp(line, "wifi clear")) {
+        net_creds_clear();
+        net_creds_changed();
+        return;
+    }
+#endif
+
+    Serial.printf("[gw] unknown command \"%s\" — try `help`\n", line);
+}
+
+// Non-blocking: at most one line is assembled per call, and an over-long line is discarded
+// whole rather than silently truncated into a half-command that might still parse.
+static void serial_console_loop() {
+    static char buf[GW_CONSOLE_LINE_MAX];
+    static size_t len = 0;
+    static bool overflow = false;
+
+    while (Serial.available()) {
+        const int c = Serial.read();
+        if (c < 0) break;
+        if (c == '\r') continue;
+        if (c == '\n') {
+            if (overflow) { Serial.println("[gw] line too long, ignored"); overflow = false; }
+            else if (len) { buf[len] = '\0'; serial_exec(buf); }
+            len = 0;
+            continue;
+        }
+        if (c == 8 || c == 127) { if (len) len--; continue; }   // backspace / DEL
+        if (len + 1 >= sizeof(buf)) { overflow = true; continue; }
+        buf[len++] = (char)c;
+    }
+}
 
 static bool s_ntp_started = false;
 static void ntp_ensure() {
@@ -2088,7 +2602,9 @@ static void draw_wifi_icon(bool wifi, int rssi) {
 // Two pages, auto-rotating every 4 s. 6x12 font = ~21 cols.
 static void oled_render() {
     const bool page2 = ((millis() / 4000) % 2) == 1;
-    const bool wifi  = WiFi.status() == WL_CONNECTED;
+    // Whatever uplink is live, not specifically WiFi. Wired reports rssi 0, which the
+    // icon's thresholds render as full bars — the truthful answer for a cable.
+    const bool online = net_up();
     char line[28];
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_6x12_tr);
@@ -2101,15 +2617,26 @@ static void oled_render() {
         const char* title = s_site_name[0] ? s_site_name : "Trail Cam";
         snprintf(line, sizeof(line), "%.17s", title);
         u8g2.drawStr(0, 10, line);
-        draw_wifi_icon(wifi, wifi ? WiFi.RSSI() : 0);
+        draw_wifi_icon(online, net_rssi());
         u8g2.drawHLine(0, 13, 128);
-        if (wifi) {
+        if (online) {
             u8g2.drawStr(0, 28, "See photos at:");
             u8g2.drawStr(0, 42, GW_VIEW_HOST);   // trailcam.example.com (family gallery)
         } else {
-            u8g2.drawStr(0, 28, "trying network:");
-            snprintf(line, sizeof(line), "%.21s", WIFI_NETS[s_wifi_idx].ssid);
-            u8g2.drawStr(0, 42, line);
+#ifdef GW_NET_HAS_WIFI
+            if (s_net_state == NET_ST_PROVISION) {
+                u8g2.drawStr(0, 28, "Needs setup:");
+                u8g2.drawStr(0, 42, "no network yet");
+            } else if (net_cred_at(s_wifi_idx).ssid) {
+                u8g2.drawStr(0, 28, "trying network:");
+                snprintf(line, sizeof(line), "%.21s", net_cred_at(s_wifi_idx).ssid);
+                u8g2.drawStr(0, 42, line);
+            } else
+#endif
+            {
+                u8g2.drawStr(0, 28, "trying network:");
+                u8g2.drawStr(0, 42, "ethernet");
+            }
         }
         snprintf(line, sizeof(line), "%u photos today", (unsigned)s_caps_today);
         u8g2.drawStr(0, 56, line);
@@ -2380,7 +2907,7 @@ void setup() {
         Serial.println("[gw] *** LoRa radio NOT initialized (absent or miswired) — "
                        "running network-only; wire the SX1262 and reboot ***");
 
-#ifdef GW_NET_ETH
+#ifdef GW_NET_HAS_ETH
     // RNS-over-UDP on the wired LAN: lets Python RNS peers (rnsd, the bench host)
     // reach the mesh through this box — the tower-bridge role. Registered now,
     // started on first link-up in loop() (the lwIP socket wants an interface).
@@ -2564,6 +3091,7 @@ void loop() {
         } else {
             s_web.handleClient();
             ArduinoOTA.handle();
+            serial_console_loop();   // stays live during an rf/test window on purpose
             net_ensure();
             return;
         }
@@ -2586,6 +3114,7 @@ void loop() {
 
     s_web.handleClient();
     ArduinoOTA.handle();
+    serial_console_loop();
 
     net_ensure();
     ntp_ensure();
@@ -2620,10 +3149,27 @@ void loop() {
             if (!web_started) { s_web.begin(); web_started = true; }
             static bool ota_started = false;
             if (!ota_started) { ota_setup(); ota_started = true; }
-#ifdef GW_NET_ETH
-            static bool udp_started = false;
-            if (!udp_started) { udp_interface.start(); udp_started = true;
-                                Serial.println("[gw] RNS UDP interface up on the wire (:4242)"); }
+#ifdef GW_NET_HAS_ETH
+            // WIRED ONLY, deliberately (an open sub-question, resolved this way for
+            // now): the RNS-over-UDP bridge is a wired-tower role — it exposes the mesh to
+            // Python RNS peers on a LAN we control. A WiFi-fallback unit sits on a
+            // customer's household network, where publishing a mesh bridge on :4242 is an
+            // attack surface nobody asked for. Revisit when a WiFi box actually needs
+            // local RNS peers. The socket binds INADDR_ANY, so once it is up it keeps
+            // working across an interface switch; it is simply never FIRST started on WiFi.
+            if (!s_udp_started && s_net_active == NET_IFACE_ETH) {
+                udp_interface.start(); s_udp_started = true;
+                Serial.println("[gw] RNS UDP interface up on the wire (:4242)");
+            } else if (s_udp_started && s_net_active == NET_IFACE_ETH) {
+                // Re-arm after net_ensure() paused it for a down window — start()
+                // is safe to call again: on ARDUINO it's udp.begin(), which stops+recreates
+                // the underlying socket itself (NetworkUDP::begin() calls stop() first).
+                // Gated on ETH same as the first-start branch above: without it, an
+                // ETH-then-WiFi failover re-arms the bridge on WiFi too, exposing :4242 on
+                // the customer's household LAN — exactly what "WIRED ONLY" above rules out.
+                udp_interface.start();
+                Serial.println("[gw] RNS UDP interface resumed");
+            }
 #endif
         }
         else {

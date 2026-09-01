@@ -342,9 +342,18 @@ static bool sdq_mount_blocking() {
     if (!SDQ_FS_MOUNT()) {
         s_sdq.mount_fails++;
         if (!s_sdq.announced) {
-            Serial.println("[gw] *** sd queue: NO CARD (SD_MMC mount failed) — upload "
-                           "queue is DEPTH 1, an outage WILL lose frames ***");
-            log_event("SD CARD ABSENT — upload depth 1, outages lose frames");
+            // NOT necessarily an absent card (2026-08-21). A mount failure is
+            // ALSO what an unformatted-for-us card looks like, and the card this queue is
+            // specced for — the SanDisk 128 GB High Endurance (gateway-sd-queue.md) — is
+            // over 32 GB, so it is SDXC and arrives formatted exFAT, which ESP-IDF's
+            // FATFS is not built to mount. Saying "NO CARD" here sent the reader hunting
+            // a slot/pull-up fault for a card that only needed reformatting.
+            Serial.println("[gw] *** sd queue: MOUNT FAILED — no card, OR a card whose "
+                           "filesystem won't mount (>32 GB cards ship exFAT; reformat "
+                           "FAT32). Upload queue is DEPTH 1, an outage WILL lose "
+                           "frames ***");
+            log_event("SD queue mount FAILED (absent, or not FAT32) — depth 1, "
+                      "outages lose frames");
             s_sdq.announced = true;
         }
         return false;

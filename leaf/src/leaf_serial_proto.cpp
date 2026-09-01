@@ -14,9 +14,8 @@
 #ifndef LEAF_NODE_SLUG
 #define LEAF_NODE_SLUG ""
 #endif
-#ifndef LEAF_FW_VERSION
-#define LEAF_FW_VERSION "leaf-0.17.4"
-#endif
+// LEAF_FW_VERSION now lives in leaf_serial_proto.h — the BLE status characteristic reports
+// the same string this telemetry does, and two defaults would drift apart.
 
 // RTC-persisted: PIR wakes mint event ids and emit the serial EVT BEFORE the radio comes
 // up, so they use the slug derived on the preceding cold boot (a PIR wake can never be
@@ -220,6 +219,15 @@ bool tc_take_ota_request(TcOtaRequest* out) {
     return true;
 }
 
+// One-shot stash for the confirmed destructive format.
+static bool s_format_pending = false;
+
+bool tc_take_format_card() {
+    if (!s_format_pending) return false;
+    s_format_pending = false;
+    return true;
+}
+
 void tc_handle_cmd_json(const char* json, tc_cmd_handler handler) {
     char kind[32] = "", eid[48] = "", quality[16] = "";
     json_str(json, "kind", kind, sizeof(kind));
@@ -248,6 +256,14 @@ void tc_handle_cmd_json(const char* json, tc_cmd_handler handler) {
             s_time_sync_unix    = (long long)unix32;
             s_time_sync_pending = true;
         }
+    }
+    if (strcmp(kind, "format_card") == 0) {
+        char confirm[16] = "";
+        json_str(json, "confirm", confirm, sizeof(confirm));
+        s_format_pending = (strcmp(confirm, "erase") == 0);
+        if (!s_format_pending)
+            Serial.println("[tc] format_card without payload {\"confirm\":\"erase\"} "
+                           "-> dropped");
     }
     if (strcmp(kind, "radio_profile") == 0) {
         uint32_t idx = 0, ttl = 0;

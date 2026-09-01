@@ -18,8 +18,9 @@
 // loss would be. The wire format needs a real server.
 // Drain ONE queued frame, newest first. Returns true when it did work (so loop() can
 // come straight back for the next one while the pipe is open). Deletes an entry only
-// after a 2xx or a permanent 4xx — an ambiguous failure keeps the file, and re-sending
-// is safe because ingest is idempotent per (event_id, kind).
+// after a 2xx or a permanently-rejected FRAME (see upload_code_is_permanent) — an
+// ambiguous failure keeps the file, and that now includes 401/429, which are outages
+// wearing a 4xx. Re-sending is safe because ingest is idempotent per (event_id, kind).
 static bool sdq_drain_one() {
     SdqPick newest;
     sdq_scan(&newest, nullptr, nullptr, /*with_free=*/false);
@@ -51,10 +52,11 @@ static bool sdq_drain_one() {
     f.close();
     if (r == UP_RETRY) return false;   // keep the file; the next pass retries it
     if (r == UP_DROP) {
-        // Custody revoked: a 4xx frame never landed, so the leaf must be free to send it
-        // again (a truncated body is exactly the shape that 422s and then re-sends fine).
+        // Custody revoked: a rejected frame never landed, so the leaf must be free to
+        // send it again (a truncated body is exactly the shape that 422s, then re-sends
+        // fine). Only reached for codes upload_code_is_permanent() blames on the FRAME.
         have_unnote(eid, kind);
-        log_event("sd queue DROP %s %s (permanent 4xx)", eid, kind);
+        log_event("sd queue DROP %s %s (frame rejected)", eid, kind);
     }
     SDQ_FS.remove(path);
     if (s_sdq.depth) s_sdq.depth--;

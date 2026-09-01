@@ -43,12 +43,25 @@ bool leaf_detector_begin() {
         return false;
     }
 
-    bool arena_internal = true;
+    // Arena placement. Default is internal-SRAM-first (gate-b's choice, see kArenaSize).
+    // LEAF_DETECT_ARENA_PSRAM reverses the preference, and anything that also wants BLE
+    // must set it: measured on the bench 2026-08-17, the internal arena costs 172 KB of
+    // internal DRAM and leaves only ~54 KB by the time RNS is up, at which point
+    // nimble_port_init() fails outright ("hci inits failed", rc=-1). Internal placement
+    // buys nothing to pay for that — this file's own measurement is 4141 ms internal vs
+    // 4145 ms PSRAM, i.e. 0.1%, because inference here is compute-bound on the reference
+    // (non-ESP-NN) kernels. Either order still falls back to the other on failure.
+#ifdef LEAF_DETECT_ARENA_PSRAM
+    const uint32_t cap_first = MALLOC_CAP_SPIRAM,   cap_second = MALLOC_CAP_INTERNAL;
+#else
+    const uint32_t cap_first = MALLOC_CAP_INTERNAL, cap_second = MALLOC_CAP_SPIRAM;
+#endif
+    bool arena_internal = (cap_first == (uint32_t)MALLOC_CAP_INTERNAL);
     if (!s_arena) {
-        s_arena = (uint8_t*)heap_caps_malloc(kArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        if (!s_arena) {   // fragmentation fallback: slower PSRAM arena
-            arena_internal = false;
-            s_arena = (uint8_t*)heap_caps_malloc(kArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_arena = (uint8_t*)heap_caps_malloc(kArenaSize, cap_first | MALLOC_CAP_8BIT);
+        if (!s_arena) {   // fragmentation / exhaustion fallback: the other pool
+            arena_internal = !arena_internal;
+            s_arena = (uint8_t*)heap_caps_malloc(kArenaSize, cap_second | MALLOC_CAP_8BIT);
         }
         if (!s_arena) { Serial.println("[det] arena alloc FAILED"); return false; }
     }

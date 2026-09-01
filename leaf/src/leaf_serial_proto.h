@@ -31,6 +31,12 @@ struct LeafTelemetry {
     const char* boot_reason  = nullptr;
 };
 
+// Firmware version string, reported in telemetry and (with LEAF_BLE) in the BLE status
+// characteristic. Here rather than in the .cpp so both report the same value.
+#ifndef LEAF_FW_VERSION
+#define LEAF_FW_VERSION "leaf-0.18.1"
+#endif
+
 // Wire identity: "leaf-" + the first 8 hex of the RNS destination hash, pushed in by the
 // radio layer once per power cycle (RTC-persisted); a non-empty LEAF_NODE_SLUG build flag
 // pins a fixed slug instead and makes tc_set_node_slug a no-op. Until either happens,
@@ -92,11 +98,23 @@ bool tc_take_ota_request(TcOtaRequest* out);
 // ssid/psk absent -> no WiFi, just awake (serial servicing). With WiFi the leaf also
 // NTP-syncs its clock (real captured_at timestamps until the next full power loss).
 // {"kind":"sleep"} during the window ends it early. Same one-shot stash pattern as OTA.
+// `seconds` overrides `minutes` when non-zero. The walk-up service window
+// wants TENS OF SECONDS on a wake that already happened, and minute granularity cannot
+// express that: the shortest window `minutes` can ask for is 60 s, which is ~0.25 mAh of
+// BLE advertising against the ~0.5-1 mAh a whole capture event costs. Operator-requested
+// maintenance still speaks in minutes and is unaffected (seconds defaults to 0).
 struct TcMaintRequest {
     char     ssid[64] = "";
     char     psk[64]  = "";
     uint32_t minutes  = 10;
+    uint32_t seconds  = 0;
 };
+
+// Window length in milliseconds, seconds-first. One place so the auto walk-up window and
+// an operator request cannot drift apart.
+static inline uint32_t tc_maint_window_ms(const TcMaintRequest& r) {
+    return r.seconds ? r.seconds * 1000UL : r.minutes * 60000UL;
+}
 bool tc_take_maint_request(TcMaintRequest* out);
 
 // kind=time_sync — the gateway is the mesh's clock authority (it has WiFi + NTP) and
@@ -113,3 +131,12 @@ bool tc_take_time_sync(long long* out_unix);
 // with an announce ON THE NEW PROFILE — the gateway reverts if that never arrives.
 // Same one-shot stash pattern as OTA.
 bool tc_take_radio_profile(uint32_t* out_idx, uint32_t* out_ttl_s);
+
+// kind=format_card — the operator says "yes, erase the card I can't read":
+//   {"kind":"format_card","payload":{"confirm":"erase"}}
+// The confirm token is required and is not decoration: this is the one command that
+// destroys data, commands are re-delivered until acked, and a bare kind is too easy to
+// send by accident from a shell. A command without it is parsed, logged and dropped.
+// The real safety gate is in leaf_store_format_card(), which refuses any card it can
+// actually read; this is the second lock, not the only one. Same one-shot stash pattern.
+bool tc_take_format_card();

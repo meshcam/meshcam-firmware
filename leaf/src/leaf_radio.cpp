@@ -11,6 +11,7 @@
 #include <microReticulum.h>
 
 #include "leaf_serial_proto.h"      // tc_node_slug / tc_set_node_slug (wire identity)
+#include "leaf_store.h"            // store state rides the announce tail
 
 // --- persistent RNS objects (rebuilt each boot; identity is the stable part) ----------
 static RNS::Reticulum reticulum({RNS::Type::NONE});
@@ -195,6 +196,15 @@ void leaf_radio_announce(const char* status) {
                       (unsigned long)s_h_pf);
         if (!isnan(s_h_vbat) && n > 0 && n < (int)sizeof(ad))
             n += snprintf(ad + n, sizeof(ad) - n, " vb=%.2f", s_h_vbat);
+    }
+    // Full-res store degraded: "sd=n" no card, "sd=u" card present but its
+    // filesystem would not mount (an out-of-the-package exFAT card — the fix is a FAT32
+    // reformat, not an RMA), "sd=?" degraded on a backend that can't tell them apart.
+    // ABSENT while the card is healthy, so a good node pays nothing for the field, and a
+    // node quietly storing to the 12.9 MB LittleFS ring stops being invisible from afar.
+    if (const char* sdc = leaf_store_state_code()) {
+        if (n > 0 && n < (int)sizeof(ad))
+            n += snprintf(ad + n, sizeof(ad) - n, " sd=%s", sdc);
     }
     if (s_ack_n && n > 0 && n < (int)sizeof(ad)) {
         n += snprintf(ad + n, sizeof(ad) - n, " a=");
