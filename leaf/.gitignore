@@ -1,3 +1,5 @@
 .pio/
 secrets.ini
 src/wire_secrets.h
+# pioarduino generates this into src/ on every build; never real config
+src/idf_component.yml

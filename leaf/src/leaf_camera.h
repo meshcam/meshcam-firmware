@@ -37,6 +37,37 @@ void leaf_camera_release(LeafFrame& frame);
 // Return the framebuffer (if any) and power the sensor back down. Safe after a failure.
 void leaf_camera_end(LeafFrame& frame);
 
+// --- live view ----------------------------------------------------------------------
+// A continuous low-resolution grab for the aiming stream, on the SAME sensor and the same
+// lazy init as the capture path above. Deliberately not a second camera driver: the two
+// never run at once in wall-clock terms, they interleave inside one service window, and
+// two configs of one driver is how the framesize switch already works.
+//
+// The stream framesize is small on purpose. This exists so a person can see what the
+// camera sees while they point it at a trail, not to take a picture — LEAF_FULL_FRAMESIZE
+// is untouched and a PIR capture in the middle of a stream still stores its QXGA original.
+
+// Stream detail tiers. VGA is the default: it fills a phone screen, and at ~20 KB a frame
+// it moves fast enough over the SoftAP to look live.
+#ifndef LEAF_STREAM_FRAMESIZE
+#define LEAF_STREAM_FRAMESIZE FRAMESIZE_VGA
+#endif
+#ifndef LEAF_STREAM_JPEG_Q
+#define LEAF_STREAM_JPEG_Q 14
+#endif
+
+// Enter streaming mode at the given framesize/quality (framesize_t values). Initializes
+// the sensor if it is cold. Returns false if the camera would not come up.
+bool leaf_camera_stream_begin(int framesize, int quality);
+
+// One stream frame, or .ok() false. Self-healing: a PIR capture sharing this window
+// deinitializes the driver and moves the framesize, and both are the normal case, so this
+// re-establishes streaming mode rather than failing. Release with leaf_camera_release().
+LeafFrame leaf_camera_stream_frame();
+
+// Leave streaming mode and power the sensor back down. Safe when no stream was running.
+void leaf_camera_stream_end();
+
 // Downscale a stored QXGA original to the "standard" tier (~800x600 JPEG) for a
 // quality:"standard" fetch_full. Pure transform — never touches the camera. Returns a
 // malloc'd buffer (caller frees with free()), or nullptr on failure (caller should then

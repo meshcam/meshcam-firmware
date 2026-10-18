@@ -1,15 +1,41 @@
 # Leaf partition table — 16 MB flash (WROOM-1 N16R8).
 # Dual OTA slots (2026-07-03): the update_firmware command streams a new image into the
 # idle slot while the old one runs, so a bad image auto-rolls-back and USB becomes
-# disaster-recovery only. Head layout unchanged (nvs at 0x9000 -> the RNS identity in
-# NVS survives, as does otadata at 0xe000); LittleFS shrinks 12.9 -> 9.9 MB, which is
-# fine — it's only the no-SD-card fallback store now (SD holds the photo archive).
-# MIGRATION: changing the table moves spiffs -> old LittleFS content is gone; flash
-# this via USB once (partitions bin @0x8000 + app @0x10000 + 0xFF-erase otadata).
+# disaster-recovery only.
+#
+# TWO NVS PARTITIONS, AND THE SECOND ONE IS THE POINT (2026-09-05).
+#
+#   nvs  @0x9000   volatile-in-practice. The WiFi/BLE stack stores PHY calibration here
+#                  (CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=y), and when it fills,
+#                  arduino-esp32's initArduino() erases the WHOLE partition and re-inits
+#                  without saying so (cores/esp32/esp32-hal-misc.c). It also sits inside
+#                  the span of firmware.factory.bin, so `write-flash 0x0` blanks it.
+#                  Anything here is disposable: the OTA "already applied" sha, and
+#                  whatever the WiFi stack wants.
+#
+#   id   @0x610000 DURABLE. The leaf's RNS identity and the portal AP key live here, and
+#                  both must outlive every firmware update the node ever takes. This
+#                  offset is chosen, not convenient:
+#                    - it is far past the end of firmware.factory.bin (~0x22b880), so a
+#                      full `esptool write-flash 0x0` cannot reach it
+#                    - initArduino()'s auto-erase resolves the FIRST data/nvs partition
+#                      in this table, which is `nvs` above, so it never touches this one
+#                  KEEP `nvs` LISTED FIRST. If `id` ever becomes the first data/nvs
+#                  entry, the auto-erase would target it and this whole fix inverts.
+#                  12 KB = 3 sectors, the NVS minimum (2 usable + 1 for compaction).
+#                  Only `esptool erase-flash` clears it, which is always deliberate.
+#
+# LittleFS is the no-SD-card fallback store only (SD holds the photo archive), so it
+# gives up the 12 KB.
+# MIGRATION: changing this table moves spiffs -> old LittleFS content is gone. Flash via
+# USB as four pieces (bootloader @0x0 + partitions @0x8000 + boot_app0 @0xe000 +
+# app @0x10000). leaf-0.23.0 copies an existing identity and AP key out of `nvs` into
+# `id` on first boot, so a board that predates this table keeps its name.
 # Name,   Type, SubType,  Offset,   Size
 nvs,      data, nvs,      0x9000,   0x5000,
 otadata,  data, ota,      0xe000,   0x2000,
 app0,     app,  ota_0,    0x10000,  0x300000,
 app1,     app,  ota_1,    0x310000, 0x300000,
-spiffs,   data, spiffs,   0x610000, 0x9E0000,
+id,       data, nvs,      0x610000, 0x3000,
+spiffs,   data, spiffs,   0x613000, 0x9DD000,
 coredump, data, coredump, 0xFF0000, 0x10000,

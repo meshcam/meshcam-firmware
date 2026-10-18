@@ -127,6 +127,16 @@ bool LoRaInterface::set_profile(uint8_t idx) {
 	coding    = p.cr;
 	_bitrate  = (double)spreading * ( (4.0/coding) / (pow(2, spreading)/bandwidth) ) * 1000.0;
 #ifdef ARDUINO
+#if defined(LORA_BACKEND_RAK3172)
+	if (_online && _rak) {
+		if (!_rak->configure(frequency, bandwidth, spreading, coding, power)) {
+			ERRORF("LoRaInterface: retune to %s failed", p.name);
+			return false;
+		}
+		INFOF("LoRaInterface: retuned to profile %u (%s, ~%u B/s raw)",
+		      (unsigned)idx, p.name, (unsigned)p.raw_bps);
+	}
+#else
 	if (_online) {
 		int s1, s2, s3;
 		if (_sx126x) {
@@ -152,6 +162,7 @@ bool LoRaInterface::set_profile(uint8_t idx) {
 		      (unsigned)idx, p.name, (unsigned)p.raw_bps);
 	}
 #endif
+#endif
 	return true;
 }
 
@@ -160,6 +171,19 @@ bool LoRaInterface::set_profile(uint8_t idx) {
 // value the radio is re-armed on its previous power and we return false.
 bool LoRaInterface::set_tx_dbm(int dbm) {
 #ifdef ARDUINO
+#if defined(LORA_BACKEND_RAK3172)
+	if (_online && _rak) {
+		if (!_rak->set_tx_dbm(dbm)) {
+			ERRORF("LoRaInterface: AT+PTP=%d rejected", dbm);
+			return false;
+		}
+		// RUI3 accepts 5..22 dBm only, so the modem may have clamped the ADR's request.
+		// Report what the PA is actually running at, not what was asked for.
+		power = _rak->tx_dbm();
+		INFOF("LoRaInterface: TX power now %d dBm", power);
+		return true;
+	}
+#else
 	if (_online) {
 		int st;
 		if (_sx126x) {
@@ -180,6 +204,7 @@ bool LoRaInterface::set_tx_dbm(int dbm) {
 		INFOF("LoRaInterface: TX power now %d dBm", dbm);
 	}
 #endif
+#endif
 	power = dbm;
 	return true;
 }
@@ -193,7 +218,7 @@ bool LoRaInterface::set_tx_dbm(int dbm) {
 // chip enters TX, so the emission reaches the antenna. OCP is raised to 140 mA so +22 dBm
 // isn't silently clamped (RadioLib's 60 mA default); left raised on restore (an upper
 // limit only, harmless for normal ops).
-#ifdef ARDUINO
+#if defined(ARDUINO) && !defined(LORA_BACKEND_RAK3172)
 bool LoRaInterface::radio_test_cw(float freq_mhz, int8_t dbm) {
 	if (!_sx126x) return false;
 	_sx126x->standby();
@@ -231,6 +256,30 @@ void LoRaInterface::radio_test_stop() {
 	set_profile(_profile);               // reconfigure SF/BW/CR for the current profile + startReceive()
 	INFO("LoRaInterface: TEST stopped -> normal RX restored");
 }
+#elif defined(ARDUINO)
+// RAK3172: stock RUI3 exposes the whole §15.247 test suite over AT (respin spec §0a
+// closed §12 q2 with it), so CW is a one-liner. AT+CW takes a DURATION, and this API has
+// no such argument, so it is armed for an hour and ended by radio_test_stop() / AT+TOFF —
+// long enough for a conducted-power measurement, and self-limiting if the bench walks away.
+bool LoRaInterface::radio_test_cw(float freq_mhz, int8_t dbm) {
+	if (!_rak) return false;
+	INFOF("LoRaInterface: TEST CW %.3f MHz @ %d dBm (AT+CW)", freq_mhz, (int)dbm);
+	return _rak->cw_start(freq_mhz, dbm, 3600000UL);
+}
+
+// No RUI3 equivalent. The SX126x path drives SetTxInfinitePreamble, a register-level
+// command unreachable through an AT modem. RUI3's own PER suite (AT+TCONF / AT+TTX) is
+// the substitute, and it is a different measurement — do not fake it here.
+bool LoRaInterface::radio_test_mod(float, float, uint8_t, uint8_t, int8_t) {
+	ERROR("LoRaInterface: modulated-continuous test is SX126x-only; use RUI3 AT+TCONF/AT+TTX");
+	return false;
+}
+
+void LoRaInterface::radio_test_stop() {
+	if (!_rak) return;
+	_rak->test_stop();
+	INFO("LoRaInterface: TEST stopped -> normal RX restored");
+}
 #else
 bool LoRaInterface::radio_test_cw(float, int8_t) { return false; }
 bool LoRaInterface::radio_test_mod(float, float, uint8_t, uint8_t, int8_t) { return false; }
@@ -248,7 +297,21 @@ bool LoRaInterface::start() {
 
 #ifdef ARDUINO
 
-#if defined(BOARD_TBEAM) || defined(BOARD_LORA32_V21)
+#if defined(LORA_BACKEND_RAK3172)
+	// Leaf/gateway PCB v1.0 — RAK3172-T over UART, AT commands. No SPI, no IRQ line, and
+	// no chip handle: everything the SX1262 branches do with RadioLib calls, this backend
+	// does with AT commands inside Rak3172Modem.
+	if (!_rak) _rak = new Rak3172Modem();
+	if (!_rak->begin(frequency, bandwidth, spreading, coding, power)) {
+		ERROR("RAK3172 init failed. Check the LORA rail, UART pins, and NRST.");
+		return false;
+	}
+	// RUI3 clamps TX power to 5..22 dBm; keep `power` honest so the announce tail's
+	// "tx=<dbm>" reports what the PA actually ran at.
+	power = _rak->tx_dbm();
+	INFOF("RAK3172 P2P up: %.3f MHz %s @ %d dBm", frequency, LORA_PROFILES[_profile].name, power);
+
+#elif defined(BOARD_TBEAM) || defined(BOARD_LORA32_V21)
 	// ESP32: T-Beam and LoRa32 use non-default SPI pins — must specify explicitly
 	SPI.begin(RADIO_SCLK_PIN, RADIO_MISO_PIN, RADIO_MOSI_PIN);
 	_module = new Module(RADIO_CS_PIN, RADIO_DIO0_PIN, RADIO_RST_PIN, RADIO_DIO1_PIN, SPI);
@@ -327,10 +390,11 @@ bool LoRaInterface::start() {
 	                        RADIOLIB_SX126X_SYNC_WORD_PRIVATE, power, 20, 1.8, false);
 
 #else
-	#error "Unsupported board: define BOARD_TBEAM, BOARD_LORA32_V21, BOARD_RAK4631, BOARD_HELTEC_V3, BOARD_HELTEC_V4, or GATE_B_WIRED_SX1262"
+	#error "Unsupported board: define LORA_BACKEND_RAK3172, BOARD_TBEAM, BOARD_LORA32_V21, BOARD_RAK4631, BOARD_HELTEC_V3, BOARD_HELTEC_V4, or GATE_B_WIRED_SX1262"
 	int state = RADIOLIB_ERR_UNKNOWN;
 #endif
 
+#if !defined(LORA_BACKEND_RAK3172)
 	if (state != RADIOLIB_ERR_NONE) {
 		ERRORF("LoRa init failed, code %d. Check wiring/board define.", state);
 		return false;
@@ -340,6 +404,7 @@ bool LoRaInterface::start() {
 	_radio->startReceive();
 
 	INFO("LoRa init succeeded.");
+#endif
 	TRACEF("LoRa bandwidth is %.2f Kbps", Utilities::OS::round(_bitrate/1000.0, 2));
 #endif
 
@@ -350,9 +415,15 @@ bool LoRaInterface::start() {
 void LoRaInterface::stop() {
 
 #ifdef ARDUINO
+#if defined(LORA_BACKEND_RAK3172)
+	// Stops RX and leaves NRST low with the UART pins floating, so the caller may cut
+	// LORA_PWR_EN straight after (respin spec §11 rail-down rule).
+	if (_rak) _rak->end();
+#else
 	if (_radio) {
 		_radio->standby();
 	}
+#endif
 #endif
 
 	_online = false;
@@ -362,6 +433,16 @@ void LoRaInterface::loop() {
 
 	if (_online) {
 #ifdef ARDUINO
+#if defined(LORA_BACKEND_RAK3172)
+		// No IRQ line exists on this backend: RUI3 delivers frames as unsolicited AT
+		// events, so a frame is only heard while this loop is being called. The modem
+		// stays armed across frames (AT+PRECV=65534 is truly continuous) — no
+		// per-event re-arm happens or is needed.
+		uint8_t rxBuf[Rak3172Modem::MAX_FRAME];
+		float rssi = NAN, snr = NAN;
+		int len = _rak ? _rak->poll(rxBuf, sizeof(rxBuf), rssi, snr) : -1;
+		if (len > 0) handle_rx_frame(rxBuf, len, rssi, snr);
+#else
 		// checkIrq() polls the hardware IRQ register — no ISR required
 		if (_radio->checkIrq(RADIOLIB_IRQ_RX_DONE)) {
 			int len = _radio->getPacketLength();
@@ -375,44 +456,9 @@ void LoRaInterface::loop() {
 			// retry round-trip later (measured 2026-07-03: ~60 s/chunk of overhead).
 			_radio->startReceive();
 
-			if (state == RADIOLIB_ERR_NONE && len > 1) {
-				last_rssi  = _radio->getRSSI();
-				last_snr   = _radio->getSNR();
-				last_rx_ms = millis();
-
-				uint8_t hdr = rxBuf[0];
-				uint8_t seq = packetSequence(hdr);
-				const uint32_t t_proc = millis();
-
-				if (isSplitPacket(hdr)) {
-					if (_rx_seq == SEQ_UNSET || _rx_seq != seq) {
-						// First part of a split (or restart after a lost first part)
-						_rx_seq = seq;
-						buffer.clear();
-						buffer.append(rxBuf + 1, len - 1);
-					} else {
-						// Second part — sequence matches; assemble and deliver
-						buffer.append(rxBuf + 1, len - 1);
-						_rx_seq = SEQ_UNSET;
-						on_incoming(buffer);
-					}
-				} else {
-					// Non-split: discard any stale partial reassembly, deliver immediately
-					if (_rx_seq != SEQ_UNSET) {
-						buffer.clear();
-						_rx_seq = SEQ_UNSET;
-					}
-					buffer.clear();
-					buffer.append(rxBuf + 1, len - 1);
-					on_incoming(buffer);
-				}
-				// One compact timeline line per frame (replaces the old RSSI/Snr pair):
-				// arrival time, frame length, signal, and how long inbound processing
-				// held the CPU — the raw material for transfer-turnaround analysis.
-				Serial.printf("[rf] rx t=%lu len=%d rssi=%.0f snr=%.1f proc=%lu\n",
-				              (unsigned long)last_rx_ms, len, last_rssi, last_snr,
-				              (unsigned long)(millis() - t_proc));
-			} else if (state != RADIOLIB_ERR_NONE) {
+			if (state == RADIOLIB_ERR_NONE) {
+				handle_rx_frame(rxBuf, len, _radio->getRSSI(), _radio->getSNR());
+			} else {
 				DEBUGF("LoRaInterface: readData failed, code %d", state);
 			}
 			// NOTE: no trailing startReceive() here — RX was re-armed right after
@@ -420,7 +466,103 @@ void LoRaInterface::loop() {
 			// arriving while we processed this one.
 		}
 #endif
+#endif
 	}
+}
+
+// One received PHY frame, whichever backend demodulated it: strip the split-packet
+// header, reassemble if needed, and hand the result to Transport. Shared on purpose —
+// the framing is the over-the-air contract with every other node on the mesh, and a
+// second copy of it would be a second chance to get it wrong.
+void LoRaInterface::handle_rx_frame(const uint8_t* rxBuf, int len, float rssi, float snr) {
+#ifdef ARDUINO
+	if (len <= 1) return;   // header-only frame carries nothing
+
+	last_rssi  = rssi;
+	last_snr   = snr;
+	last_rx_ms = millis();
+
+	uint8_t hdr = rxBuf[0];
+	uint8_t seq = packetSequence(hdr);
+	const uint32_t t_proc = millis();
+
+	// Expire a partial whose second half never came, so a lost s2 cannot strand the
+	// slot until the next split happens to reuse it.
+	if (_rx_seq != SEQ_UNSET && (uint32_t)(millis() - _rx_seq_ms) > SPLIT_REASSEMBLY_MS) {
+		split_buffer.clear();
+		_rx_seq = SEQ_UNSET;
+	}
+
+	if (isSplitPacket(hdr)) {
+		if (_rx_seq == SEQ_UNSET || _rx_seq != seq) {
+			// First part of a split (or restart after a lost first part)
+			_rx_seq = seq;
+			_rx_seq_ms = millis();
+			split_buffer.clear();
+			split_buffer.append(rxBuf + 1, len - 1);
+		} else {
+			// Second part — sequence matches; assemble and deliver
+			split_buffer.append(rxBuf + 1, len - 1);
+			_rx_seq = SEQ_UNSET;
+			on_incoming(split_buffer);
+			split_buffer.clear();
+		}
+	} else {
+		// Non-split: deliver immediately. It MUST NOT touch a reassembly in progress
+		// — the gateway's announce and time_sync are both non-split and
+		// arrive constantly, and clearing here destroyed every split packet on a busy
+		// link. `buffer` is now the immediate-delivery buffer only.
+		buffer.clear();
+		buffer.append(rxBuf + 1, len - 1);
+		on_incoming(buffer);
+	}
+	// One compact timeline line per frame (replaces the old RSSI/Snr pair):
+	// arrival time, frame length, signal, and how long inbound processing
+	// held the CPU — the raw material for transfer-turnaround analysis.
+	Serial.printf("[rf] rx t=%lu len=%d rssi=%.0f snr=%.1f proc=%lu\n",
+	              (unsigned long)last_rx_ms, len, last_rssi, last_snr,
+	              (unsigned long)(millis() - t_proc));
+#else
+	(void)rxBuf; (void)len; (void)rssi; (void)snr;
+#endif
+}
+
+// One PHY frame out. `tag` labels the split parts in the [rf] tx timeline ("", " s1",
+// " s2") and in the error message.
+bool LoRaInterface::send_frame(const uint8_t* buf, size_t len, const char* tag) {
+#ifdef ARDUINO
+#if defined(LORA_BACKEND_RAK3172)
+	// The modem answers +EVT:TXP2P DONE only after the air time is over, so the wait has
+	// to cover it: 3x the profile's own raw byte rate plus a fixed floor for the AT
+	// round trip. A max-length frame on the slowest rung (sf12/bw500, 146 B/s) is ~1.7 s
+	// of air, so this lands near 6.7 s there and ~2 s on the fast rungs.
+	const uint16_t raw_bps = LORA_PROFILES[_profile].raw_bps;
+	uint32_t timeout = 1500 + (uint32_t)((uint32_t)len * 3000UL / (raw_bps ? raw_bps : 100));
+	uint32_t t_tx = millis();
+	bool ok = _rak && _rak->transmit(buf, len, timeout);
+	Serial.printf("[rf] tx t=%lu len=%u air=%lu%s\n", (unsigned long)t_tx,
+	              (unsigned)len, (unsigned long)(millis() - t_tx), tag);
+	if (!ok) ERRORF("LoRaInterface: transmit%s failed (no TXP2P DONE)", tag);
+	return ok;
+#else
+	// V4: switch FEM to TX mode before transmitting
+	if (_pa_mode_pin >= 0) { digitalWrite(_pa_mode_pin, HIGH); }
+	uint32_t t_tx = millis();
+	int state = _radio->transmit(const_cast<uint8_t*>(buf), len);
+	// V4: return FEM to RX mode
+	if (_pa_mode_pin >= 0) { digitalWrite(_pa_mode_pin, LOW); }
+	Serial.printf("[rf] tx t=%lu len=%u air=%lu%s\n", (unsigned long)t_tx,
+	              (unsigned)len, (unsigned long)(millis() - t_tx), tag);
+	if (state != RADIOLIB_ERR_NONE) {
+		ERRORF("LoRaInterface: transmit%s failed, code %d", tag, state);
+		return false;
+	}
+	return true;
+#endif
+#else
+	(void)buf; (void)len; (void)tag;
+	return true;
+#endif
 }
 
 /*virtual*/ bool LoRaInterface::send_outgoing(const Bytes& data) {
@@ -437,19 +579,7 @@ void LoRaInterface::loop() {
 				// Single-frame send
 				txBuf[0] = rand_nibble;
 				memcpy(txBuf + 1, data.data(), data.size());
-
-				// V4: switch FEM to TX mode before transmitting
-				if (_pa_mode_pin >= 0) { digitalWrite(_pa_mode_pin, HIGH); }
-				uint32_t t_tx = millis();
-				int state = _radio->transmit(txBuf, 1 + data.size());
-				// V4: return FEM to RX mode, then re-arm receive
-				if (_pa_mode_pin >= 0) { digitalWrite(_pa_mode_pin, LOW); }
-				Serial.printf("[rf] tx t=%lu len=%u air=%lu\n", (unsigned long)t_tx,
-				              (unsigned)(1 + data.size()), (unsigned long)(millis() - t_tx));
-				if (state != RADIOLIB_ERR_NONE) {
-					ERRORF("LoRaInterface: transmit failed, code %d", state);
-					success = false;
-				}
+				if (!send_frame(txBuf, 1 + data.size(), "")) success = false;
 			} else {
 				// Split send — two frames with matching sequence number
 				uint8_t seq       = (_tx_seq_ctr++) & HEADER_SEQ_MASK;
@@ -458,40 +588,20 @@ void LoRaInterface::loop() {
 				// Frame 1: first LORA_MAX_PAYLOAD bytes
 				txBuf[0] = split_hdr;
 				memcpy(txBuf + 1, data.data(), LORA_MAX_PAYLOAD);
-
-				// V4: switch FEM to TX mode before transmitting
-				if (_pa_mode_pin >= 0) { digitalWrite(_pa_mode_pin, HIGH); }
-				uint32_t t_tx = millis();
-				int state = _radio->transmit(txBuf, 1 + LORA_MAX_PAYLOAD);
-				// V4: return FEM to RX mode, then re-arm receive
-				if (_pa_mode_pin >= 0) { digitalWrite(_pa_mode_pin, LOW); }
-				Serial.printf("[rf] tx t=%lu len=%u air=%lu s1\n", (unsigned long)t_tx,
-				              (unsigned)(1 + LORA_MAX_PAYLOAD), (unsigned long)(millis() - t_tx));
-				if (state != RADIOLIB_ERR_NONE) {
-					ERRORF("LoRaInterface: transmit part 1 failed, code %d", state);
-					success = false;
-				}
+				if (!send_frame(txBuf, 1 + LORA_MAX_PAYLOAD, " s1")) success = false;
 
 				// Frame 2: remaining bytes
 				size_t remainder = data.size() - LORA_MAX_PAYLOAD;
 				txBuf[0] = split_hdr;
 				memcpy(txBuf + 1, data.data() + LORA_MAX_PAYLOAD, remainder);
-
-				// V4: switch FEM to TX mode before transmitting
-				if (_pa_mode_pin >= 0) { digitalWrite(_pa_mode_pin, HIGH); }
-				t_tx = millis();
-				state = _radio->transmit(txBuf, 1 + remainder);
-				// V4: return FEM to RX mode, then re-arm receive
-				if (_pa_mode_pin >= 0) { digitalWrite(_pa_mode_pin, LOW); }
-				Serial.printf("[rf] tx t=%lu len=%u air=%lu s2\n", (unsigned long)t_tx,
-				              (unsigned)(1 + remainder), (unsigned long)(millis() - t_tx));
-				if (state != RADIOLIB_ERR_NONE) {
-					ERRORF("LoRaInterface: transmit part 2 failed, code %d", state);
-					success = false;
-				}
+				if (!send_frame(txBuf, 1 + remainder, " s2")) success = false;
 			}
 
+#if !defined(LORA_BACKEND_RAK3172)
 			_radio->startReceive();
+#endif
+			// (the RAK backend re-arms RX inside transmit(), because TX and RX are
+			// mutually exclusive there and it had to leave RX to send at all)
 #endif
 			TRACE("LoRaInterface: sent bytes");
 		}

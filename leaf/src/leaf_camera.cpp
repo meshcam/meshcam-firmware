@@ -110,6 +110,49 @@ LeafFrame leaf_camera_capture_full() {
     return out;
 }
 
+// --- live view ----------------------------------------------------------------------
+// -1 = not streaming. Held across frames so leaf_camera_stream_frame() can tell whether
+// the sensor still has the mode it was left in.
+static int s_stream_fs = -1;
+static int s_stream_q  = LEAF_STREAM_JPEG_Q;
+
+bool leaf_camera_stream_begin(int framesize, int quality) {
+    if (!camera_init_full()) return false;
+    s_stream_fs = framesize;
+    s_stream_q  = quality;
+    // Cold sensor: the first frames out of a fresh init are washed out while AEC settles,
+    // and the first thing the operator sees IS the product here. Spend two frames on it.
+    if (!set_mode((framesize_t)framesize, quality, 2)) { s_stream_fs = -1; return false; }
+    Serial.printf("[cam] stream mode: framesize %d q%d\n", framesize, quality);
+    return true;
+}
+
+LeafFrame leaf_camera_stream_frame() {
+    LeafFrame out;
+    if (s_stream_fs < 0) return out;
+    // Both of these are the NORMAL path, not error recovery. A PIR edge inside the same
+    // service window runs on_pir_event(), which grabs at QXGA and then leaf_camera_end()s
+    // the driver outright. The stream is expected to survive that: the person aiming the
+    // camera is exactly the person most likely to trip its own PIR.
+    if (!camera_init_full()) return out;
+    sensor_t* s = esp_camera_sensor_get();
+    if (!s) return out;
+    if ((int)s->status.framesize != s_stream_fs) {
+        // One settle frame, not two: mid-stream the sensor is already warm, and the
+        // operator would read a two-frame stall as the stream dying.
+        if (!set_mode((framesize_t)s_stream_fs, s_stream_q, 1)) return out;
+    }
+    out.fb = esp_camera_fb_get();
+    return out;   // .ok() false is survivable — the caller skips this frame and retries
+}
+
+void leaf_camera_stream_end() {
+    if (s_stream_fs < 0) return;
+    s_stream_fs = -1;
+    if (s_inited) { esp_camera_deinit(); s_inited = false; leaf_cam_rail(false); }
+    Serial.println("[cam] stream mode off, sensor down");
+}
+
 void leaf_camera_release(LeafFrame& frame) {
     if (frame.fb) { esp_camera_fb_return(frame.fb); frame.fb = nullptr; }
 }

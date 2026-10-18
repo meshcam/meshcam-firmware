@@ -103,7 +103,7 @@ static void fit_mark(const char* stage) {
 
 static void fit_summary() {
     Serial.println();
-    Serial.println("========================= BLE FIT RUNTIME RESULTS =========================");
+    Serial.println("======================== BLE FIT RUNTIME RESULTS ========================");
     Serial.printf("%-22s %12s %12s %12s %12s\n",
                   "stage", "int_free", "int_largest", "psram_free", "delta_int");
     for (int i = 0; i < s_nmarks; i++) {

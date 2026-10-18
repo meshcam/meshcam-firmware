@@ -29,17 +29,22 @@
 #include "esp_system.h"          // esp_reset_reason
 #include "esp_ota_ops.h"         // esp_ota_mark_app_valid_cancel_rollback
 #include "leaf_camera.h"
+#include "leaf_nvs.h"
 #include "leaf_serial_proto.h"
 #include "leaf_ota.h"
 #include "leaf_store.h"
 #ifdef LEAF_RADIO
 #include "leaf_radio.h"
+#include <lora_profiles.h>       // orphan-sweep family bounds; vendored lib
 #endif
 #ifdef LEAF_DETECTOR
 #include "leaf_detector.h"
 #endif
 #ifdef LEAF_BLE
 #include "leaf_ble.h"
+#endif
+#ifdef LEAF_PORTAL
+#include "leaf_portal.h"
 #endif
 
 #ifndef LEAF_PIR_GPIO
@@ -67,7 +72,11 @@ RTC_DATA_ATTR uint32_t g_push_fails   = 0;   // alert pushes that failed (bug 5)
                                              // looked like a quiet cam)
 RTC_DATA_ATTR int64_t  g_unixtime     = 0;   // approx wall clock; 0 = unknown until the
                                              // gateway syncs it (piggybacked on an ACK).
-RTC_DATA_ATTR uint32_t g_last_sleep_s = 0;   // how long we intended to sleep last time
+RTC_DATA_ATTR uint32_t g_last_sleep_s = 0;   // how long we INTENDED to sleep last time.
+                                             // Diagnostic only (print_status "slept~%us").
+                                             // It was the clock's advance until the RTC change —
+                                             // see the clock block in setup() for why
+                                             // intention is the wrong thing to count.
 
 // ADR (adaptive radio profile, leaf-0.10.0): the gateway grants profile switches by
 // index into the shared table (lib/lora_interface/lora_profiles.h). The grant lives in
@@ -81,6 +90,18 @@ RTC_DATA_ATTR uint32_t g_last_sleep_s = 0;   // how long we intended to sleep la
 RTC_DATA_ATTR uint8_t g_rf_profile      = LEAF_RF_BASE_PROFILE;
 RTC_DATA_ATTR int64_t g_rf_grant_until  = 0;   // unix deadline; 0 = no grant active
 RTC_DATA_ATTR uint8_t g_rf_silent_wakes = 0;   // consecutive wakes w/o gateway contact
+// Orphan sweep (leaf-0.24.0): base is the rendezvous, but it is not always where
+// the gateway's ears are — a single-leaf site holding a grant keeps its gateway camped on
+// the granted rung, and a SECOND leaf announcing on base there is never heard, never
+// TOFU-pinned, never adopted. The gateway can't listen down without abandoning the leaf
+// it serves, so the node with nothing to lose does the moving: until the FIRST gateway
+// packet ever reaches us, timer check-ins rotate across the profile family (base every
+// other wake). One announce on the camped rung is enough — TOFU pins us and the gateway's
+// multi-leaf walk-back drops the whole site to base. Any contact retires the sweep until
+// the next full power loss, so an adopted leaf never wanders off base on its own.
+RTC_DATA_ATTR uint8_t g_rf_ever_contact = 0;   // any gateway packet since power-on
+RTC_DATA_ATTR uint8_t g_rf_orphan_wakes = 0;   // contactless wakes while never-contacted
+RTC_DATA_ATTR uint8_t g_rf_sweep_step   = 0;   // position in the sweep rotation
 
 // --- adaptive check-in interval ------------------------------------------------------
 // Governs ONLY the proactive timer check-ins (command latency), never PIR captures.
@@ -201,8 +222,9 @@ static bool g_maint_exit = false;
 
 // Gateway time sync (2026-07-03): set the SYSTEM clock, not just g_unixtime — the
 // ESP32-S3 RTC timer keeps time(nullptr) ticking through deep sleep, so one sync makes
-// every later wake's clock exact (PIR wakes included, whose slept portion the interval
-// arithmetic can't know) until the next full power loss.
+// every later wake's clock exact until the next full power loss. Since the RTC change the seed
+// site does the same thing, so the RTC is the clock whether or not a gateway ever
+// appears; a sync now only corrects the ABSOLUTE value, never the rate.
 static void handle_time_sync() {
     long long unix_now = 0;
     if (!tc_take_time_sync(&unix_now)) return;
@@ -221,8 +243,49 @@ static void handle_time_sync() {
 // and the gateway independently falls back when it stops hearing us. Neither side
 // needs the other's cooperation to get home.
 #ifdef LEAF_RADIO
+#include <lora_profiles.h>   // family bounds for the orphan sweep (vendored lib)
 #define LEAF_RF_GRANT_TTL_S      (24 * 3600)   // grant life without a gateway refresh
 #define LEAF_RF_SILENT_WAKES_MAX 3
+// Orphan sweep: see the RTC block up top for the why. Starts after this many
+// contactless wakes (wake 0 is the cold-boot "hello", so commissioning still leads with
+// base), and stays inside OUR ladder family — same clamp and the same reason as the
+// gateway's GW_RF_FAMILY_MIN/MAX: idx 3 is the far end of the cert family sitting right
+// after the near end of the legacy one, and crossing families is a flag day, not a sweep.
+#define LEAF_RF_SWEEP_AFTER_WAKES 2
+#define LEAF_RF_FAMILY_MIN ((uint8_t)(LEAF_RF_BASE_PROFILE <= 2 ? 0 : 3))
+#define LEAF_RF_FAMILY_MAX ((uint8_t)(LEAF_RF_BASE_PROFILE <= 2 ? 2 : LORA_PROFILE_COUNT - 1))
+
+static bool s_rf_seeking = false;   // this wake's announce rides a swept rung ("seek")
+
+// Timer wakes only: a PIR thumb push is a real capture and goes out on the best-guess
+// rendezvous (base), never on a gamble. Cold boots always "hello" on base too, so the
+// surveyor/commissioning flow sees exactly what it saw before. The rotation is
+// base, near, base, far, ... — base every other wake keeps the plain no-gateway-yet
+// case (and a base-camped gateway) converging as fast as today, and the off-base wakes
+// walk the family nearest-first because an up-granted camp is the common one. The swept
+// rung is staged for radio init but g_rf_profile stays base: a sweep is a place we
+// LISTEN FROM for one wake, not a grant, so the granted-revert bookkeeping never sees it.
+static void rf_orphan_sweep_begin(esp_sleep_wakeup_cause_t cause) {
+    s_rf_seeking = false;
+    if (cause != ESP_SLEEP_WAKEUP_TIMER) return;
+    if (g_rf_ever_contact) return;
+    if (g_rf_orphan_wakes < LEAF_RF_SWEEP_AFTER_WAKES) return;
+    const uint8_t step = g_rf_sweep_step++;
+    if (step & 1) return;          // odd steps: back on base (it stays every other wake)
+    const uint8_t rungs = LEAF_RF_FAMILY_MAX - LEAF_RF_FAMILY_MIN;   // off-base count
+    if (rungs == 0) return;        // degenerate one-rung family: nothing to sweep
+    const uint8_t want = (uint8_t)((step >> 1) % rungs);
+    uint8_t n = 0, pick = LEAF_RF_BASE_PROFILE;
+    for (int idx = LEAF_RF_FAMILY_MAX; idx >= (int)LEAF_RF_FAMILY_MIN; idx--) {
+        if ((uint8_t)idx == LEAF_RF_BASE_PROFILE) continue;
+        if (n++ == want) { pick = (uint8_t)idx; break; }
+    }
+    if (pick == LEAF_RF_BASE_PROFILE || !leaf_radio_set_profile(pick)) return;
+    s_rf_seeking = true;
+    Serial.printf("[leaf] ADR: never heard a gateway (%u contactless wakes) -> "
+                  "seeking on %s this wake\n",
+                  (unsigned)g_rf_orphan_wakes, leaf_radio_profile_name());
+}
 
 static void handle_radio_profile() {
     uint32_t idx = 0, ttl = 0;
@@ -252,8 +315,11 @@ static void handle_radio_profile() {
 
 // Before any radio use this wake: decide base-vs-granted, stage the choice for
 // leaf_radio_begin(). Runs even on PIR wakes (the thumb push must already be tuned).
-static void rf_profile_wake_begin() {
-    if (g_rf_profile == LEAF_RF_BASE_PROFILE) return;
+static void rf_profile_wake_begin(esp_sleep_wakeup_cause_t cause) {
+    if (g_rf_profile == LEAF_RF_BASE_PROFILE) {
+        rf_orphan_sweep_begin(cause);   // no grant standing: maybe seek off-base
+        return;
+    }
     const char* revert = nullptr;
     if (g_rf_silent_wakes >= LEAF_RF_SILENT_WAKES_MAX) revert = "no gateway contact";
     else if (g_rf_grant_until && g_unixtime > g_rf_grant_until) revert = "grant expired";
@@ -387,6 +453,10 @@ static void on_pir_event() {
         leaf_camera_end(frame);
         return;
     }
+    // Stamp the event at the shutter, not at wake. setup() read the clock once, and
+    // camera init plus this grab already cost seconds; the detector adds ~4 s more
+    // before tc_new_event() below reads g_unixtime. The RTC keeps the system clock.
+    if (time(nullptr) > 1700000000) g_unixtime = (int64_t)time(nullptr);
     size_t len = frame.fb->len;
     int    w   = frame.fb->width;
     int    h   = frame.fb->height;
@@ -460,7 +530,10 @@ static void on_scheduled_checkin() {
         // listening, because the gateway fires queued commands at us the moment it
         // HEARS this announce (announce-handler wake-triggered delivery).
         leaf_radio_set_health(g_pir_wakes, g_captures, g_push_fails, leaf_read_vbat());
-        leaf_radio_announce("checkin");     // heartbeat so the gateway sees us alive
+        // "seek" instead of "checkin" on a swept rung: the status rides the
+        // announce and the gateway's serial/beat trail, so a bench log shows the sweep
+        // running — and shows which rung finally got heard — without any new wire field.
+        leaf_radio_announce(s_rf_seeking ? "seek" : "checkin");
     }
 #else
     Serial.println("[leaf] scheduled check-in -> (stub) brief RX window + heartbeat");
@@ -533,33 +606,85 @@ static bool maint_wifi_join(const TcMaintRequest& req, bool* ntp_ok) {
     return true;
 }
 
+// How long each downlink poll inside the window is allowed to block. Both polls sit on
+// the same thread as the portal's HTTP server, so a full second inside one of them is a
+// full second the phone's request is not being answered — long enough for a captive
+// probe to give up. While the AP is up the window is sliced small instead: the same wall
+// clock is still spent polling, in more pieces, and the mesh downlink is unaffected.
+static inline uint32_t maint_poll_ms() {
+#ifdef LEAF_PORTAL
+    // A live view is drawn one frame per pass through this loop, so the poll
+    // slice IS the frame interval: at 100 ms nothing above 10 fps is reachable no matter
+    // how fast the sensor is. 5 ms each keeps both downlinks answering while leaving the
+    // frame rate to the camera and the air, which is where the limit belongs.
+    if (leaf_portal_streaming()) return 5;
+    if (leaf_portal_active()) return 100;
+#endif
+    return 1000;
+}
+
 static void maintenance_loop(const TcMaintRequest& req) {
     leaf_cam_rail_hold();   // awake-mode PIR captures must never switch the rail under load
     const uint32_t deadline_ms = tc_maint_window_ms(req);
     Serial.printf("[maint] entering maintenance mode for %u s (wifi=%s)\n",
                   (unsigned)(deadline_ms / 1000), req.ssid[0] ? req.ssid : "no");
     bool ntp_ok = false;
+    // Joining a named network is the one thing that can already own the 2.4 GHz radio
+    // when we get here, so it is decided first and everything below reads its answer.
+    [[maybe_unused]] const bool wifi_up = maint_wifi_join(req, &ntp_ok);
 #ifdef LEAF_BLE
-    const bool wifi_up = maint_wifi_join(req, &ntp_ok);
-
     // Walk-up access: the maintenance window IS the "operator standing at
     // the camera" case BLE exists for, so that is where it lives. ONE 2.4 GHz radio, so
     // BLE only comes up when WiFi is not already holding it, and a phone asking for the
     // WiFi handoff tears BLE all the way down before WiFi touches the radio (leaf_ble.h).
     if (!wifi_up) {
-        if (leaf_ble_begin())
+        if (leaf_ble_begin()) {
+#ifdef LEAF_PORTAL
+            // Hand the phone the AP name and key up front. Without creds the
+            // "wifi" command raises OUR AP, and its WPA2 key is minted per-node into NVS —
+            // so a handoff that does not carry it strands the operator at their phone's
+            // password prompt, which is exactly what board 0013 did on 2026-09-03. Staged
+            // BEFORE the first status so the app holds it from its first read, rather than
+            // chasing a notify that races the BLE teardown. Both accessors are valid with
+            // the AP still down; the psk one mints on first call.
+            if (!req.ssid[0]) leaf_ble_set_ap(leaf_portal_ssid(), leaf_portal_psk());
+            else              leaf_ble_set_ap(nullptr, nullptr);   // handoff joins THEIR network
+#endif
             leaf_ble_set_status(tc_node_slug(), LEAF_FW_VERSION, g_boot_count,
                                 g_pir_wakes, g_captures, g_push_fails, leaf_read_vbat());
+        }
     } else {
         Serial.println("[maint] WiFi holds the radio -> BLE not started (single-radio rule)");
     }
-#else
-    maint_wifi_join(req, &ntp_ok);
+#endif
+#ifdef LEAF_PORTAL
+    // The no-infrastructure walk-up path: raise our OWN network so a phone can
+    // reach us with no router, no cell and no gateway in earshot.
+    //
+    // Third in line, and both of the things ahead of it are the single-radio rule, not a
+    // preference. A station join means an operator already handed us a network and that
+    // network is the better link. BLE, where it is compiled in, is the DISCOVERY channel:
+    // it is far cheaper to leave advertising, so it goes first and the phone asks for the
+    // AP through it (the LEAF_BLE_CMD_WIFI handoff below). On a build with no BLE — which
+    // is every v1.0 board today — this is the whole walk-up path, and it comes up here.
+    if (!wifi_up
+#ifdef LEAF_BLE
+        && !leaf_ble_active()
+#endif
+    ) {
+        if (leaf_portal_begin())
+            leaf_portal_set_status(tc_node_slug(), LEAF_FW_VERSION, g_boot_count,
+                                   g_pir_wakes, g_captures, g_push_fails, leaf_read_vbat(),
+                                   leaf_store_state_code());
+    }
 #endif
 
     g_maint_exit = false;
     const uint32_t start_ms    = millis();
     uint32_t last_announce = 0;
+#ifdef LEAF_PORTAL
+    uint32_t last_portal_status = 0;
+#endif
     // Arm the awake-mode PIR path. The pin is often still HIGH here (this wake was
     // likely the PIR event itself); RISING means we only fire on the NEXT motion.
     // ext0 arming routed the pad to the RTC mux, where the digital GPIO matrix (and
@@ -584,6 +709,30 @@ static void maintenance_loop(const TcMaintRequest& req) {
     while (!g_maint_exit && millis() - deadline_from_ms < deadline_ms) {
 #ifdef LEAF_BLE
         if (leaf_ble_connected()) deadline_from_ms = millis();
+#endif
+#ifdef LEAF_PORTAL
+        // Pump the captive DNS and HTTP first thing every pass. A phone that waits too
+        // long for its probe answer decides the network is broken and walks away, so this
+        // is not a background chore that can wait for the radio polls below.
+        leaf_portal_loop();
+        if (leaf_portal_active()) {
+            // Same held deadline as a live GATT link, with the ceiling leaf_portal.h
+            // argues for: a phone rejoins a remembered network from a pocket, so
+            // "associated" is weaker evidence of a person than "connected over BLE" is.
+            if (leaf_portal_connected() && millis() - start_ms < LEAF_PORTAL_MAX_S * 1000UL)
+                deadline_from_ms = millis();
+            leaf_portal_set_deadline(deadline_from_ms + deadline_ms);
+            // Throttled: this pass runs ~10x a second and leaf_read_vbat() is an ADC
+            // read. The page refreshes itself every 10 s, so 2 s is already finer than
+            // anything a reader can see.
+            if (!last_portal_status || millis() - last_portal_status > 2000) {
+                last_portal_status = millis();
+                leaf_portal_set_status(tc_node_slug(), LEAF_FW_VERSION, g_boot_count,
+                                       g_pir_wakes, g_captures, g_push_fails,
+                                       leaf_read_vbat(), leaf_store_state_code());
+            }
+            if (leaf_portal_take_cmd() == LEAF_PORTAL_CMD_SLEEP) g_maint_exit = true;
+        }
 #endif
         if (time(nullptr) > 1700000000) {       // system clock valid (NTP or time_sync)
             g_unixtime = (int64_t)time(nullptr);
@@ -611,7 +760,7 @@ static void maintenance_loop(const TcMaintRequest& req) {
             last_announce = millis();
             leaf_radio_announce("maint");
         }
-        leaf_radio_poll_commands(1000, on_mesh_command);
+        leaf_radio_poll_commands(maint_poll_ms(), on_mesh_command);
 #endif
 #ifdef LEAF_BLE
         // Walk-up downlink. Commands are QUEUED by the NimBLE host callback and executed
@@ -626,8 +775,23 @@ static void maintenance_loop(const TcMaintRequest& req) {
                     // BLE rather than tearing down for nothing. (Credential delivery over
                     // The GATT path is separate; this is the transition it will rely on.)
                     if (!req.ssid[0]) {
+#ifdef LEAF_PORTAL
+                        // No network to join is the WALK-UP case, not an error: the phone
+                        // is standing at the camera in a woodlot and there is nothing out
+                        // here to join. Raise our own AP instead. Same handoff
+                        // order either way — BLE all the way down before WiFi touches the
+                        // radio — so this is a different destination, not a different rule.
+                        Serial.println("[maint] BLE handoff -> dropping BLE, raising our own AP");
+                        leaf_ble_end();
+                        if (leaf_portal_begin())
+                            leaf_portal_set_status(tc_node_slug(), LEAF_FW_VERSION,
+                                                   g_boot_count, g_pir_wakes, g_captures,
+                                                   g_push_fails, leaf_read_vbat(),
+                                                   leaf_store_state_code());
+#else
                         Serial.println("[maint] BLE asked for WiFi but no creds in the "
                                        "maintenance request -> staying on BLE");
+#endif
                         break;
                     }
                     Serial.println("[maint] BLE handoff -> dropping BLE, bringing WiFi up");
@@ -646,17 +810,20 @@ static void maintenance_loop(const TcMaintRequest& req) {
                                 g_pir_wakes, g_captures, g_push_fails, leaf_read_vbat());
         }
 #endif
-        tc_poll_commands(1000, on_gateway_command);
+        tc_poll_commands(maint_poll_ms(), on_gateway_command);
     }
     detachInterrupt(digitalPinToInterrupt((int)PIR_GPIO));
 #ifdef LEAF_BLE
     leaf_ble_end();   // never deep-sleep with the controller still holding its heap
 #endif
 
-    // Keep the RTC clock honest for whatever we do next: NTP made it exact; otherwise
-    // credit the (remaining, uncredited) time we sat here.
-    if (ntp_ok) g_unixtime = (int64_t)time(nullptr);
+    // Keep g_unixtime honest for whatever we do next: read the system clock if it is
+    // running (it always is since the RTC change), else credit the uncredited time we sat here.
+    if (time(nullptr) > 1700000000) g_unixtime = (int64_t)time(nullptr);
     else if (g_unixtime > 0) g_unixtime += (millis() - clock_credit_ms) / 1000;
+#ifdef LEAF_PORTAL
+    leaf_portal_end();   // AP down and radio off before we go anywhere near deep sleep
+#endif
     if (req.ssid[0]) { WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
     Serial.printf("[maint] maintenance over (%s) -> normal sleep cycle\n",
                   g_maint_exit ? "sleep command" : "deadline");
@@ -912,8 +1079,9 @@ static void arm_and_sleep() {
     leaf_log_vbat();          // PCB: battery divider on IO3 (no-op on bench)
     leaf_env_log();           // PCB: BME280 T/RH/P (no-op unless LEAF_BME280)
     leaf_rails_all_off();     // PCB: camera + radio rails hard-off for the sleep floor
-    Serial.printf("[leaf] arming: PIR on GPIO%d + timer %us  (time %s)\n",
-                  (int)PIR_GPIO, (unsigned)interval, time_known ? "known" : "unknown");
+    Serial.printf("[leaf] arming: PIR on GPIO%d + timer %us  (time %s, clock %lld)\n",
+                  (int)PIR_GPIO, (unsigned)interval, time_known ? "known" : "unknown",
+                  (long long)g_unixtime);
     Serial.flush();
     // TODO(power): rtc_gpio_isolate() unused pins, power down RTC peripherals we don't
     //              need, to reach the ~tens-of-uA floor. Measure with a uCurrent/meter.
@@ -1144,6 +1312,11 @@ void setup() {
     g_boot_count++;
     print_status(cause);
 
+    // Before anything else can touch NVS: move the identity and the AP key into the
+    // durable partition if this board still keeps them in the default one.
+    // No-op on every boot after the first one following the 0.22.0 update.
+    leaf_nvs_migrate_durable();
+
     // Brownout backoff FIRST — before the OTA flash write, radio-profile staging, and any
     // rail. A rail that collapsed last boot must settle, not take another current pulse
     // (or a flash write). Stateless by design; see brownout_backoff_sleep() for the why.
@@ -1156,22 +1329,41 @@ void setup() {
     // a no-op error when there's nothing pending, so safe to call every wake.
     esp_ota_mark_app_valid_cancel_rollback();
 
-    // Clock, best source first: the RTC-kept system clock (ticks through deep sleep;
-    // valid once any time_sync/NTP ran this power cycle) > interval arithmetic on
-    // g_unixtime > the build-timestamp seed. The gateway pushes a time_sync on our
-    // cold-boot "hello", so the seed only covers the first minute after power loss.
+    // Clock: the RTC-kept system clock is the ONLY source. It ticks through deep sleep
+    // and through awake time, and it does not care what woke us. Seed it here if it is
+    // not running; a gateway time_sync corrects the absolute value later.
+    //
+    // 2026-09-05, board 0013: the seed used to set g_unixtime and NOT the system
+    // clock, so a node that had never met a gateway ran its whole power cycle on an
+    // arithmetic fallback that credited the INTENDED sleep interval — dropping every
+    // second the board was awake, and crediting a PIR wake with ZERO. Measured 66% of
+    // real time over 6 h, with a 74% ceiling even on a quiet node. The arithmetic is gone;
+    // seeding the clock hands timekeeping to the RTC, which counts real seconds.
     const bool rtc_clock_valid = time(nullptr) > 1700000000;
     if (rtc_clock_valid) {
         g_unixtime = (int64_t)time(nullptr);
-    } else if (g_unixtime == 0) {
-        g_unixtime = build_epoch();
-        Serial.printf("[leaf] clock seeded from build time: %lld\n", (long long)g_unixtime);
+    } else {
+        // Prefer whatever RTC RAM already holds if it is later than the build stamp: a
+        // gateway-synced g_unixtime can outlive the system clock across a reset, and the
+        // clock must never step BACKWARDS. Both candidates are in the past, so this
+        // cannot break the bug-6 rule that the seed must never run AHEAD of real time
+        // (build_epoch() is the build host's UTC epoch, stamped before this image could
+        // possibly have been running).
+        const int64_t bepoch = build_epoch();
+        const bool    carried = g_unixtime > bepoch;
+        const int64_t seed    = carried ? g_unixtime : bepoch;
+        struct timeval tv = {};
+        tv.tv_sec = (time_t)seed;
+        settimeofday(&tv, nullptr);
+        g_unixtime = seed;
+        Serial.printf("[leaf] clock seeded from %s: %lld (RTC counts real seconds from here)\n",
+                      carried ? "RTC RAM" : "build time", (long long)seed);
     }
 
 #ifdef LEAF_RADIO
     // ADR: stage the granted (or reverted) radio profile BEFORE any radio use — a PIR
     // wake's thumb push is the first TX and must already be on the negotiated profile.
-    rf_profile_wake_begin();
+    rf_profile_wake_begin(cause);
 #ifdef LEAF_TX_SWEEP
     tx_sweep_wake_begin();   // before any radio use, so the announce TXes at it too
 #endif
@@ -1185,10 +1377,9 @@ void setup() {
         const bool  vb_ok = !isnan(vb) && vb >= LEAF_VBAT_SENSE_FLOOR_V;
         if (g_lowbatt) {
             if (vb_ok && vb < LEAF_VBAT_RESUME_V) {
-                // Still low. Unsynced-clock fallback advance (mirrors the TIMER case
-                // below, which we never reach), then straight back down.
-                if (!rtc_clock_valid && g_unixtime > 0 && cause == ESP_SLEEP_WAKEUP_TIMER)
-                    g_unixtime += g_last_sleep_s;
+                // Still low -> straight back down. No clock work here: the block above
+                // already read the RTC, which kept counting through the lockout sleep
+                // (the RTC change deleted the interval-arithmetic mirror that used to live here).
 #if defined(LEAF_BLE) && LEAF_LOCKOUT_KEEP_PIR && LEAF_WALKUP_WINDOW_S > 0
                 // A PIR wake down here means something moved in front of a node that is
                 // dark. Most of those are animals, so the gap does the gating: at most one
@@ -1226,11 +1417,7 @@ void setup() {
 
     switch (cause) {
         case ESP_SLEEP_WAKEUP_EXT0:  g_pir_wakes++;   on_pir_event();        break;
-        case ESP_SLEEP_WAKEUP_TIMER: g_timer_wakes++; on_scheduled_checkin();
-            // Unsynced fallback only: advance the approx clock by the slept interval
-            // (the RTC clock path above already includes it exactly).
-            if (!rtc_clock_valid && g_unixtime > 0) g_unixtime += g_last_sleep_s;
-            break;
+        case ESP_SLEEP_WAKEUP_TIMER: g_timer_wakes++; on_scheduled_checkin();  break;
         default:                                       on_cold_boot();        break;
     }
 
@@ -1261,7 +1448,23 @@ void setup() {
     bool serviced = false;
     if (tc_take_maint_request(&maint)) { maintenance_loop(maint); serviced = true; }
 
-#if defined(LEAF_BLE) && LEAF_WALKUP_WINDOW_S > 0
+// A portal build raises the AP on the PIR walk-up window, same as a BLE build advertises
+// on it. ON by default, because without it the feature's whole premise fails: the point
+// of SoftAP-before-BLE (design.md, "BLE vs SoftAP-only: sequence it") is that a person
+// walks up, opens their phone's WiFi list and finds the camera, with no app and no store
+// account in the way. An AP that has to be ASKED for over the mesh cannot be found by
+// someone standing in front of the camera, which is the only place this is used.
+//
+// It is a flag anyway, because the cost is real and unmeasured. BLE advertising rides a
+// wake that was going to happen and the design note's "standing cost is zero" holds for
+// it; a WiFi AP is the largest draw on the board, and motion is not consent — deer trip
+// the PIR too. Two things already bound it: the walk-up window is off entirely unless the
+// env sets LEAF_WALKUP_WINDOW_S, and LEAF_WALKUP_MIN_GAP_S caps how often it can open. The
+// per-window number still belongs on the PPK2 before any of this ships on battery.
+#ifndef LEAF_PORTAL_ON_WALKUP
+#define LEAF_PORTAL_ON_WALKUP 1
+#endif
+#if (defined(LEAF_BLE) || (defined(LEAF_PORTAL) && LEAF_PORTAL_ON_WALKUP)) && LEAF_WALKUP_WINDOW_S > 0
     // Walk-up service window. The person walking up to the camera trips the
     // PIR, so the wake we need is a wake that was already going to happen: after the
     // normal capture work, advertise for a few tens of seconds and let a phone find us.
@@ -1280,7 +1483,9 @@ void setup() {
         (g_walkup_last_unix == 0 || g_unixtime - g_walkup_last_unix >= (int64_t)LEAF_WALKUP_MIN_GAP_S ||
          g_unixtime < g_walkup_last_unix)) {   // clock stepped backwards (NTP/time_sync): don't wedge
         g_walkup_last_unix = g_unixtime;
-        TcMaintRequest walkup;              // no ssid: BLE only, no WiFi join attempt
+        TcMaintRequest walkup;              // no ssid: never joins a network, so the
+                                            // window runs on BLE, or on our own AP where
+                                            // LEAF_PORTAL_ON_WALKUP asked for it
         walkup.seconds = LEAF_WALKUP_WINDOW_S;
         Serial.printf("[leaf] PIR wake -> walk-up service window %u s\n",
                       (unsigned)LEAF_WALKUP_WINDOW_S);
@@ -1295,6 +1500,18 @@ void setup() {
     if (g_rf_profile != LEAF_RF_BASE_PROFILE) {
         if (leaf_radio_had_contact()) g_rf_silent_wakes = 0;
         else if (g_rf_silent_wakes < 255) g_rf_silent_wakes++;
+    }
+    // Orphan-sweep bookkeeping: the first gateway packet EVER retires the sweep
+    // for this power cycle — after that, "no contact this wake" usually just means the
+    // gateway had nothing to say, which is not a reason to wander off the rendezvous.
+    if (leaf_radio_had_contact()) {
+        if (!g_rf_ever_contact)
+            Serial.println("[leaf] ADR: first gateway contact -> orphan sweep retired");
+        g_rf_ever_contact = 1;
+        g_rf_orphan_wakes = 0;
+        g_rf_sweep_step   = 0;
+    } else if (!g_rf_ever_contact && g_rf_orphan_wakes < 255) {
+        g_rf_orphan_wakes++;
     }
 #endif
 

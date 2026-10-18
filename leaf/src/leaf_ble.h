@@ -58,10 +58,27 @@ const char* leaf_ble_name();
 // Stage the status payload the characteristic serves on read and pushes on notify. Small
 // JSON, same counters the RNS announce tail carries so both channels agree:
 //   {"node":"...","fw":"...","boot":N,"pir":N,"cap":N,"fail":N,"vb":x.xx}
+// plus "ap"/"key" when leaf_ble_set_ap() has staged them.
 // Safe to call before begin() (staged) or with a phone connected (notifies subscribers).
 void leaf_ble_set_status(const char* node, const char* fw, uint32_t boot_count,
                          uint32_t pir_wakes, uint32_t captures, uint32_t push_fails,
                          float vbat_v);
+
+// Stage the credentials of the AP this node will raise if the phone writes "wifi", as
+// "ap" and "key" in the status payload. Sticky: every later set_status() keeps carrying
+// them until this is called with nullptr. Pass nullptr/"" where the "wifi" command leads
+// somewhere else (a station join) or nowhere (the lockout window refuses it) — advertising
+// an AP the node is not going to raise is worse than saying nothing.
+//
+// WHY THIS IS SERVED ON READ, not held back until a "wifi" command is accepted (
+// found the hard way on board 0013): the handoff tears the whole BLE stack down, so a
+// notify racing that teardown is the least reliable moment in the session to deliver the
+// one thing the operator cannot proceed without. Staging it up front means the app already
+// holds the key before it asks, and there is no race left to lose. It gives nothing away
+// either: this link is unauthenticated, so anyone who could read the key here could
+// equally write "wifi" and be handed the same AP. Real protection needs BLE pairing, not
+// a delivery-order trick.
+void leaf_ble_set_ap(const char* ssid, const char* psk);
 
 // True while a phone holds a GATT connection.
 bool leaf_ble_connected();

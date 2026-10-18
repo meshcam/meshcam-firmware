@@ -5,8 +5,14 @@
 #include <microReticulum/Type.h>
 
 #ifdef ARDUINO
+#if defined(LORA_BACKEND_RAK3172)
+// Leaf/gateway PCB v1.0: the radio is a RAK3172-T module on a UART, not a bare SX1262 on
+// SPI. Same RNS framing, same profile table, different transport — see Rak3172Modem.h.
+#include "Rak3172Modem.h"
+#else
 #include <SPI.h>
 #include <RadioLib.h>
+#endif
 #endif
 
 #include <stdint.h>
@@ -95,18 +101,34 @@ public:
 private:
 	virtual bool send_outgoing(const RNS::Bytes& data);
 	void on_incoming(const RNS::Bytes& data);
+	// Backend-independent halves of the wire protocol, so the SX1262 and RAK3172 paths
+	// cannot drift apart on the split-packet framing (which is subtle and shared with
+	// every other node on the mesh).
+	void handle_rx_frame(const uint8_t* buf, int len, float rssi, float snr);
+	bool send_frame(const uint8_t* buf, size_t len, const char* tag);
 
 public:
 	// Split-packet protocol constants
 	static constexpr uint8_t HEADER_SPLIT     = 0x08;  // bit 3: split-packet flag
 	static constexpr uint8_t HEADER_SEQ_MASK  = 0x07;  // bits 2:0: sequence number
 	static constexpr uint8_t SEQ_UNSET        = 0xFF;  // sentinel: no split in progress
+	// A split's two frames go out back to back; the slowest rung (sf12/bw500) is ~1.7 s
+	// of air each, so anything past this means s2 is never coming.
+	static constexpr uint32_t SPLIT_REASSEMBLY_MS = 8000;
 	static constexpr int     LORA_MAX_PAYLOAD = 254;   // 255 - 1 header byte
 
 private:
 	//uint8_t buffer[Type::Reticulum::MTU] = {0};
 	const uint8_t message_count = 0;
 	RNS::Bytes buffer;
+	// Reassembly gets its OWN buffer (2026-09-03). It used to share `buffer`
+	// with the immediate-delivery path, so ANY non-split frame arriving between s1 and
+	// s2 wiped the partial and reset _rx_seq — and the gateway's periodic announce and
+	// time_sync are both non-split and constant. Every split packet on a busy link was
+	// being destroyed mid-flight, which is why commands large enough to split (OTA, and
+	// any command over ~150 B of JSON) never arrived while small ones always did.
+	RNS::Bytes split_buffer;
+	uint32_t   _rx_seq_ms = 0;        // millis of the s1 that opened the current reassembly
 
 	uint8_t _rx_seq     = SEQ_UNSET;  // sequence of split RX in progress
 	uint8_t _tx_seq_ctr = 0;          // rolling TX split sequence counter
@@ -133,7 +155,11 @@ private:
 	                                 // ⚠️ CHANGING THIS IS A FLAG DAY — every node must
 	                                 // be reflashed together or they are mutually deaf.
 #endif
-	const float frequency = LORA_FREQ_MHZ;   // MHz
+	// DOUBLE. Several of the grant's channel centres (904.6, 907.8, 909.4, 912.6 …) are
+	// not exactly representable in float, and the RAK backend has to turn this into an
+	// integer Hz count for AT+P2P — 903.9f became 903900024 Hz before this was widened.
+	// RadioLib takes a float and narrows it straight back, so the SX1262 path is unchanged.
+	const double frequency = LORA_FREQ_MHZ;   // MHz
 	float       bandwidth = LORA_PROFILES[LORA_PROFILE_BASE].bw_khz;
 	int         spreading = LORA_PROFILES[LORA_PROFILE_BASE].sf;
 	int         coding    = LORA_PROFILES[LORA_PROFILE_BASE].cr;
@@ -148,6 +174,9 @@ private:
 	int         power     = LORA_TX_DBM;   // runtime-overridable via set_tx_dbm()
 
 #ifdef ARDUINO
+#if defined(LORA_BACKEND_RAK3172)
+	Rak3172Modem*  _rak         = nullptr;
+#else
 	Module*        _module      = nullptr;
 	PhysicalLayer* _radio       = nullptr;
 	SX126x*        _sx126x      = nullptr;  // set on SX1262 boards; enables live retune
@@ -155,6 +184,7 @@ private:
 	                                        // Typed SX1278: RadioLib declares the SF/BW/CR
 	                                        // setters there, not on the SX127x base.
 	int            _pa_mode_pin = -1;    // V4 FEM PA mode pin; -1 = not present
+#endif
 #endif
 
 };

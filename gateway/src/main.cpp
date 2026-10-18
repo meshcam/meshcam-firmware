@@ -61,6 +61,23 @@
 #if !defined(GW_NET_HAS_ETH) || defined(GW_NET_DUALSTACK)
 #define GW_NET_HAS_WIFI
 #endif
+// SoftAP + captive portal provisioning: the consumer front-end onto the
+// credential store AND the claim flow. Compiled into every build that HAS WiFi:
+// the production dual-stack gateway PCB, which is the SKU this exists for, and the Heltec
+// WiFi boards, where it is what makes the thing testable on hardware that exists today.
+// An ethernet-only PoE build has no WiFi at all, so it is excluded automatically and
+// never pays for this. -DGW_NO_PROVISION_PORTAL opts a build out explicitly, for a
+// sealed tower unit that should not be ABLE to raise an AP.
+#if defined(GW_NET_HAS_WIFI) && !defined(GW_NO_PROVISION_PORTAL)
+#define GW_HAS_PORTAL
+#include <DNSServer.h>       // bundled with arduino-esp32; answers "*" with the AP IP
+// Declared up here because things far above the portal itself have to know about it:
+// wifi_ensure() must not drop the AP when it rotates the STA, and web_root() hands "/"
+// to the setup form while the box is unprovisioned.
+static bool s_portal_up = false;
+static char s_portal_ssid[24] = "";   // "meshcam-gw-XXXX"; console + OLED print it
+static void portal_page();
+#endif
 #ifdef GW_NET_HAS_ETH
 #include <ETH.h>            // wired ethernet (LAN8720 RMII or W5500 SPI)
 #include <UDPInterface.h>   // vendored (lib/udp_interface): RNS-over-UDP on the wire
@@ -71,7 +88,7 @@
 #define GW_SITE "home"
 #endif
 #ifndef GW_FW_VERSION
-#define GW_FW_VERSION "gateway-0.15.1"
+#define GW_FW_VERSION "gateway-0.22.0"
 #endif
 #ifndef GW_VIEW_HOST
 #define GW_VIEW_HOST "trailcam.example.com"   // family gallery shown on the OLED
@@ -79,18 +96,116 @@
 #ifndef GW_OTA_PASS
 #define GW_OTA_PASS "trailcam-ota"     // real value injected from secrets.ini
 #endif
+// The ingest URL and token used to be mandatory at compile time. With the claim flow
+// (homelab docs/trailcam/gateway-provisioning.md) both can instead arrive at
+// RUNTIME and live in NVS, so the baked macros are now the FALLBACK and may be absent —
+// the same relaxation the WiFi guard below went through for field provisioning.
+// -DGW_NO_CLAIM restores the old contract for a build that must not carry the claim
+// path (a flash-squeezed env): there the baked values are the only source again.
+#ifdef GW_NO_CLAIM
 #if !defined(GW_INGEST_URL) || !defined(GW_INGEST_TOKEN)
-#error "GW_INGEST_URL / GW_INGEST_TOKEN required — see secrets.ini.example"
+#error "GW_INGEST_URL / GW_INGEST_TOKEN required with -DGW_NO_CLAIM — see secrets.ini.example"
+#endif
+#else
+#ifndef GW_INGEST_URL
+#define GW_INGEST_URL ""
+#endif
+#ifndef GW_INGEST_TOKEN
+#define GW_INGEST_TOKEN ""
+#endif
 #endif
 #if !defined(GW_NET_HAS_ETH) && !defined(GW_NET_HAS_WIFI)
 #error "no uplink compiled in — define GW_NET_ETH, GW_NET_ETH_W5500 and/or GW_NET_DUALSTACK"
 #endif
-// A WiFi-ONLY build has nowhere to get credentials from, so baked ones are mandatory. A
-// dual-stack build may legitimately ship with none: ethernet needs no creds and the WiFi
-// half is provisioned in the field (see net_creds_* below).
-#if defined(GW_NET_HAS_WIFI) && !defined(GW_NET_HAS_ETH) && \
+// A build with NO way to acquire credentials in the field must bake them. Two things
+// count as a way: ethernet (needs no credential at all; the WiFi half gets provisioned
+// later, see net_creds_* below), and the provisioning portal, which is precisely a
+// credential source. A WiFi-only build with neither would boot with an empty list and
+// sit in PROVISION forever with nothing listening, so that one is still an error.
+#if defined(GW_NET_HAS_WIFI) && !defined(GW_NET_HAS_ETH) && !defined(GW_HAS_PORTAL) && \
     (!defined(GW_WIFI_SSID) || !defined(GW_WIFI_PSK))
 #error "GW_WIFI_SSID / GW_WIFI_PSK required for the WiFi build — see secrets.ini.example"
+#endif
+
+// --- claim block ------------------------------------------------------------------------
+// WHO THIS GATEWAY UPLOADS AS. A claimed unit carries its site slug, ingest URL and
+// per-unit device token in NVS ("gateway" namespace, beside the WiFi credential and the
+// RNS identity); every use below goes through the gw_site()/gw_url()/gw_token()
+// accessors, which fall back to the baked macros when no claim block exists. So an
+// unclaimed unit behaves byte-identically to every build before gateway-0.16.0, and a
+// claimed one ignores the macros entirely. Keys:
+//   claim_code  the 10 normalized code symbols (kept: RECLAIMING re-authenticates
+//               with it unattended after a token revocation)
+//   claim_site  site slug                     claim_url  full ingest URL
+//   claim_tok   per-unit device token         claim_tid  token id, for revocation
+// Written by the claim client (step 7: portal / serial console / LAN /setup), cleared
+// by factory reset — which must NEVER clear rns_prv, the identity is the second claim
+// factor and the device's serial number to the whole mesh. NVS is not secure storage
+// and the design doc does not pretend otherwise: the token is scoped to one tenant's
+// ingest and revocable from the app in one click.
+#ifndef GW_NO_CLAIM
+static char s_claim_code[11] = "";   // 10 Crockford symbols + NUL
+static char s_claim_site[65] = "";   // control-plane slug limit is 64
+static char s_claim_url[129] = "";   // https://<slug>.getmeshcam.com/api/v1/ingest
+static char s_claim_tok[81]  = "";   // "tc_" + token_urlsafe(32) = 46 today, room to grow
+static char s_claim_tid[41]  = "";   // UUID, 36
+
+static void claim_load() {
+    Preferences p;
+    if (!p.begin("gateway", /*readOnly=*/true)) return;   // namespace not created yet
+    p.getString("claim_code", s_claim_code, sizeof(s_claim_code));
+    p.getString("claim_site", s_claim_site, sizeof(s_claim_site));
+    p.getString("claim_url",  s_claim_url,  sizeof(s_claim_url));
+    p.getString("claim_tok",  s_claim_tok,  sizeof(s_claim_tok));
+    p.getString("claim_tid",  s_claim_tid,  sizeof(s_claim_tid));
+    p.end();
+    if (s_claim_site[0])
+        Serial.printf("[gw] claim block: site \"%s\", token %s\n", s_claim_site,
+                      s_claim_tok[0] ? "present" : "MISSING");
+}
+
+static void claim_clear() {
+    Preferences p;
+    p.begin("gateway", /*readOnly=*/false);
+    p.remove("claim_code"); p.remove("claim_site"); p.remove("claim_url");
+    p.remove("claim_tok");  p.remove("claim_tid");
+    p.end();
+    s_claim_code[0] = s_claim_site[0] = s_claim_url[0] = 0;
+    s_claim_tok[0] = s_claim_tid[0] = 0;
+}
+
+static const char* gw_site()  { return s_claim_site[0] ? s_claim_site : GW_SITE; }
+static const char* gw_token() { return s_claim_tok[0]  ? s_claim_tok  : GW_INGEST_TOKEN; }
+static const char* gw_url()   { return s_claim_url[0]  ? s_claim_url  : GW_INGEST_URL; }
+#else
+static inline const char* gw_site()  { return GW_SITE; }
+static inline const char* gw_token() { return GW_INGEST_TOKEN; }
+static inline const char* gw_url()   { return GW_INGEST_URL; }
+#endif
+
+// An unprovisioned unit (no claim block AND no baked secrets) has nowhere to upload.
+// Every HTTP path early-returns on this rather than hammering timeouts against an
+// empty URL; frames keep queueing to the SD until a claim lands.
+static inline bool gw_provisioned() { return gw_url()[0] != '\0' && gw_token()[0] != '\0'; }
+
+// Filled at boot from the RNS identity: the two values kitting reads off this console
+// in one step (meshcam-unit register --pubkey <key> --expect <id>). The key is
+// X25519(32) then Ed25519(32), 64 bytes; the device id is the first 8 hex of the
+// identity hash, exactly what the claim control plane derives from the key.
+static char s_pubkey_hex[129] = "";
+static char s_device_id[12]   = "";
+static char s_identity_hash[33] = "";
+
+#ifndef GW_NO_CLAIM
+// The claim client itself lives in claim_client.inc (included after the JSON helpers
+// it parses with); these are the seams the console and the upload paths call through.
+static RNS::Identity s_identity({RNS::Type::NONE});   // set in setup(); signs the claim
+static bool claim_start(const char* entered);
+static void claim_tick();
+static void claim_note_ingest_401();
+static void claim_note_ingest_ok();
+static void claim_console_status();
+static void claim_forget();
 #endif
 
 // --- network abstraction ----------------------------------------------------------------
@@ -231,6 +346,26 @@ static long long json_ll(const char* json, const char* key);
 // "what is the mesh doing right now" is one browser tab away, no laptop attached.
 #include <WebServer.h>
 static WebServer s_web(80);
+// begin() binds the listener, so it must not run before an interface exists (binding
+// early leaves it dead, connection refused) and must not run twice. Two callers: the
+// first network-up in loop(), and the provisioning portal, which serves its form over
+// the SoftAP while net_up() is still false.
+static bool s_web_started = false;
+static void web_begin_once() { if (!s_web_started) { s_web.begin(); s_web_started = true; } }
+// One stylesheet for every setup-facing page (the SoftAP portal and the LAN /setup claim
+// form) so they read as the same product whichever path the customer lands on.
+static const char GW_SETUP_CSS[] PROGMEM =
+    "<!doctype html><meta charset=utf-8>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>MeshCam gateway setup</title><style>"
+    "body{font:16px system-ui,-apple-system,sans-serif;background:#111;color:#ddd;"
+    "margin:0;padding:1.5em;max-width:26em}h1{font-size:19px;color:#8f8;margin:0}"
+    "label{display:block;margin:1.1em 0 .3em;color:#bbb;font-size:14px}"
+    "input,select,button{font:inherit;width:100%;box-sizing:border-box;padding:.6em;"
+    "border-radius:6px;border:1px solid #444;background:#1b1b1b;color:#eee}"
+    "button{margin-top:1.5em;background:#2a7;border:0;color:#04120a;font-weight:600}"
+    "p{color:#999;font-size:13px;line-height:1.5}.e{color:#f88}a{color:#8bf}"
+    "b{color:#ddd}</style>";
 #define GW_EVT_SLOTS 30
 static char     s_evt[GW_EVT_SLOTS][104];
 static uint32_t s_evt_ms[GW_EVT_SLOTS];
@@ -321,9 +456,19 @@ struct LeafEntry {
     char     status[24]      = "";       // "hello"/"checkin"/... of the latest announce
     char     health[96]      = "";       // health tail "p=.. c=.. f=.." (bug 5)
     uint32_t last_direct_ms  = 0;        // 0 = not heard direct this boot
+    uint32_t base_heard_ms   = 0;        // last direct announce heard while WE sat on base
+    bool     shep_wait       = false;    // walk-back shepherd still owes this leaf
+    volatile uint32_t announce_ms = 0;   // millis() when dispatch set `announced` (send-delay probe)
     uint32_t last_sync_ms    = 0;        // per-leaf time_sync cadence (bug 10)
     bool     synced_once     = false;
     bool     sync_urgent     = false;    // profile adopt/change -> resync (bug 10)
+    // Witness evidence for the TOFU auto re-arm: how many DIRECT announces
+    // carrying a health tail this entry has produced since boot, and when the first of
+    // them landed. Per entry on purpose — a single global counter was reset to 1 by
+    // every announce from a different leaf, so two live cameras at one site knocked
+    // each other's evidence down and the rule could never fire where it matters most.
+    uint8_t  dh_n            = 0;
+    uint32_t dh_first_ms     = 0;
 };
 static LeafEntry s_roster[GW_ROSTER_MAX];
 static int       s_roster_n        = 0;
@@ -380,6 +525,37 @@ static void save_roster() {
     p.putBytes("roster", buf, (size_t)s_roster_n * 16);
     p.end();
 }
+
+// --- TOFU auto re-arm knobs + state — the policy and the argument for these
+// bounds are at tofu_rearm_scan() further down; they sit here because web_root()
+// renders them and it is defined long before that.
+#ifndef GW_TOFU_REARM_GRACE_MS
+#define GW_TOFU_REARM_GRACE_MS      (30UL * 60UL * 1000UL)   // bench: -DGW_TOFU_REARM_GRACE_MS=120000
+#endif
+#ifndef GW_TOFU_REARM_MIN_SPAN_MS
+#define GW_TOFU_REARM_MIN_SPAN_MS   (10UL * 60UL * 1000UL)   // bench: -DGW_TOFU_REARM_MIN_SPAN_MS=60000
+#endif
+#ifndef GW_TOFU_REARM_MIN_HEARD
+#define GW_TOFU_REARM_MIN_HEARD     3
+#endif
+#ifndef GW_TOFU_REARM_COOLDOWN_MS
+#define GW_TOFU_REARM_COOLDOWN_MS   (6UL * 3600UL * 1000UL)
+#endif
+#ifndef GW_TOFU_REARM_MAX_PER_BOOT
+#define GW_TOFU_REARM_MAX_PER_BOOT  2
+#endif
+
+// Witness evidence from a NON-roster leaf. Roster members carry their own counters
+// (LeafEntry::dh_n above); this is the one extra slot a stranger gets, because on a
+// single-camera site the replacement leaf is foreign at first and is the only witness
+// that will ever exist there. One slot only: two strangers trading announces displace
+// each other, which is exactly the case where neither should qualify.
+static uint8_t  s_live_hash[16]  = {0};
+static uint8_t  s_live_heard     = 0;      // direct+health announces from s_live_hash
+static uint32_t s_live_first_ms  = 0;      // millis() of the first of them
+static bool     s_live_valid     = false;
+static uint8_t  s_rearms_done    = 0;      // re-arms performed this boot
+static uint32_t s_last_rearm_ms  = 0;
 
 static void log_event(const char* fmt, ...) {
     va_list ap;
@@ -475,6 +651,9 @@ struct RfState {
     uint8_t  pending = 0xFF;               // grant sent, awaiting leaf confirm (0xFF none)
     uint8_t  prev    = LORA_PROFILE_BASE;  // revert target on confirm timeout
     bool     scanning = false;             // leaf lost off-base -> alternating camp
+    uint8_t  shep_rung = 0xFF;             // walk-back shepherd: vacated rung to
+                                           // sweep for the incumbent (0xFF = idle)
+    uint32_t shep_start_ms = 0, shep_toggle_ms = 0;
     uint32_t pending_ms = 0, last_leaf_ms = 0, last_switch_ms = 0,
              last_grant_tx_ms = 0, last_scan_ms = 0;
     uint8_t  announces_since_tx = 0;       // announces heard since our last grant TX
@@ -560,6 +739,12 @@ static bool radio_busy() {
 }
 
 static void web_root() {
+#ifdef GW_HAS_PORTAL
+    // An unprovisioned box has no mesh worth showing, and whoever just joined its AP is
+    // here to set it up. Phones probe "/" as often as their vendor probe URL, so this is
+    // a real entry point into the portal, not just a nicety.
+    if (s_portal_up) { portal_page(); return; }
+#endif
     String h;
     h.reserve(4600);
     h += F("<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=5>"
@@ -568,9 +753,11 @@ static void web_root() {
            "td{padding:2px 10px;border-bottom:1px solid #333}.t{color:#888}</style>"
            "<h1>trailcam gateway — live mesh</h1><p>");
     char line[380];
-    char rftag[28] = "";
+    char rftag[32] = "";
     if (s_rf.pending != 0xFF) strcpy(rftag, " (confirming)");
     else if (s_rf.scanning)   strcpy(rftag, " (scanning)");
+    else if (s_rf.shep_rung != 0xFF)
+        snprintf(rftag, sizeof(rftag), " (shepherding %s)", rf_name(s_rf.shep_rung));
     else if (rf_hold_active())
         snprintf(rftag, sizeof(rftag), " (base hold %lum left)",
                  (unsigned long)((s_rf_hold_until - millis()) / 60000u + 1));
@@ -600,6 +787,33 @@ static void web_root() {
              s_roster_n, GW_ROSTER_MAX,
              s_roster_n ? "" : " — TOFU armed, first direct health announce pins");
     h += line;
+    // TOFU auto re-arm: the operator-visible half. A re-arm removes a pin
+    // without anyone asking, so the page says so, and says what the gateway is currently
+    // willing to act on.
+    {
+        char rearm[220];
+        if (s_rearms_done) {
+            char ago[24];
+            human_ago(millis() - s_last_rearm_ms, ago, sizeof(ago));
+            snprintf(rearm, sizeof(rearm),
+                     "<br><b style=color:#fc8>TOFU auto re-armed %u time(s) this boot, "
+                     "last %s</b> — a pin was dropped without a human asking; see the "
+                     "event log below", (unsigned)s_rearms_done, ago);
+        } else {
+            // Best witness evidence on hand, so "why hasn't it fired?" is answerable
+            // from the page instead of from the source.
+            unsigned best = s_live_valid ? s_live_heard : 0;
+            for (int i = 0; i < s_roster_n; i++)
+                if (s_roster[i].dh_n > best) best = s_roster[i].dh_n;
+            snprintf(rearm, sizeof(rearm),
+                     "<br><span class=t>TOFU auto re-arm: armed from %lu min uptime "
+                     "(now %lu); best witness %u/%u direct health announces</span>",
+                     (unsigned long)(GW_TOFU_REARM_GRACE_MS / 60000UL),
+                     (unsigned long)(millis() / 60000UL),
+                     best, (unsigned)GW_TOFU_REARM_MIN_HEARD);
+        }
+        h += rearm;
+    }
 #ifdef GW_SD_QUEUE
     // The glanceable half of the alarm: no card here means outages lose frames, and this
     // page is what someone standing at the tower with a phone actually looks at.
@@ -666,19 +880,23 @@ static void queue_beat(const char* fmt, ...) {
 }
 
 static void post_beats() {
-    if (!s_beat_n || !net_up()) return;
+    if (!s_beat_n || !net_up() || !gw_provisioned()) return;
     WiFiClientSecure tls;
     tls.setInsecure();
     HTTPClient http;
     http.setConnectTimeout(6000);
     http.setTimeout(8000);
-    String url = String(GW_INGEST_URL);
+    String url = String(gw_url());
     url.replace("/ingest", "/telemetry");
     for (int i = 0; i < s_beat_n; i++) {
         if (!http.begin(tls, url)) break;
-        http.addHeader("Authorization", "Bearer " GW_INGEST_TOKEN);
+        http.addHeader("Authorization", String("Bearer ") + gw_token());
         http.addHeader("Content-Type", "application/json");
         int code = http.POST((uint8_t*)s_beats[i], strlen(s_beats[i]));
+#ifndef GW_NO_CLAIM
+        if (code == 401) claim_note_ingest_401();
+        else if (code >= 200 && code < 300) claim_note_ingest_ok();
+#endif
         if (code < 200 || code >= 300)
             Serial.printf("[gw] telemetry beat -> HTTP %d (dropped)\n", code);
         http.end();
@@ -974,11 +1192,11 @@ static void handle_chunk(const char* hdr, const uint8_t* body, size_t blen,
         if (isnan(LoRaInterface::last_rssi))
             queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\","
                        "\"extra\":{\"transfer\":%s}}",
-                       GW_SITE, cam[0] ? cam : gw_fallback_camera(), tj);
+                       gw_site(), cam[0] ? cam : gw_fallback_camera(), tj);
         else
             queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\","
                        "\"rssi\":%.0f,\"snr\":%.1f,\"extra\":{\"transfer\":%s}}",
-                       GW_SITE, cam[0] ? cam : gw_fallback_camera(),
+                       gw_site(), cam[0] ? cam : gw_fallback_camera(),
                        LoRaInterface::last_rssi, LoRaInterface::last_snr, tj);
     }
 
@@ -991,7 +1209,7 @@ static void handle_chunk(const char* hdr, const uint8_t* body, size_t blen,
                    "\"extra\":{\"transfer\":{\"event_id\":\"%s\",\"reassembled\":%u,"
                    "\"chunks\":%u,\"ms\":%lu,\"bps\":%lu,\"quality\":\"%s\","
                    "\"profile\":\"%s\",\"raw_bps\":%u}}}",
-                   GW_SITE, s_asm.camera[0] ? s_asm.camera : gw_fallback_camera(),
+                   gw_site(), s_asm.camera[0] ? s_asm.camera : gw_fallback_camera(),
                    eid, (unsigned)s_asm.total,
                    s_asm.chunks, (unsigned long)span_ms,
                    (unsigned long)(span_ms ? (uint64_t)s_asm.total * 1000 / span_ms : 0),
@@ -1056,13 +1274,13 @@ static void handle_probe(const char* hdr, size_t total_len, uint32_t res_ms) {
     if (isnan(rssi))
         queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"surveyor\","
                    "\"extra\":{\"probe\":%s,\"ms\":%lu,\"bytes\":%u,\"profile\":\"%s\"}}",
-                   GW_SITE, slug[0] ? slug : "surveyor", hdr,
+                   gw_site(), slug[0] ? slug : "surveyor", hdr,
                    (unsigned long)res_ms, (unsigned)total_len, rf_name(s_rf.current));
     else
         queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"surveyor\","
                    "\"rssi\":%.0f,\"snr\":%.1f,"
                    "\"extra\":{\"probe\":%s,\"ms\":%lu,\"bytes\":%u,\"profile\":\"%s\"}}",
-                   GW_SITE, slug[0] ? slug : "surveyor", rssi, snr, hdr,
+                   gw_site(), slug[0] ? slug : "surveyor", rssi, snr, hdr,
                    (unsigned long)res_ms, (unsigned)total_len, rf_name(s_rf.current));
     if (isnan(rssi))
         snprintf(s_probe_ack, sizeof(s_probe_ack),
@@ -1084,7 +1302,7 @@ static void on_resource_concluded(const RNS::Resource& resource) {
         // honestly attribute it to — it is gateway-observed state (node-identity.md).
         queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
                    "\"extra\":{\"transfer_error\":\"resource_failed_%d\"}}",
-                   GW_SITE, GW_SITE, (int)resource.status());
+                   gw_site(), gw_site(), (int)resource.status());
         return;
     }
     const RNS::Bytes& d = resource.data();
@@ -1161,7 +1379,7 @@ static void on_link_established(RNS::Link& link) {
     // particular camera's — this is what used to mint the leaf-unknown pseudo-node.
     queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
                "\"extra\":{\"link\":\"up\",\"via\":\"mesh\"}}",
-               GW_SITE, GW_SITE);
+               gw_site(), gw_site());
     latest_link = link;
     link.set_resource_strategy(RNS::Type::Link::ACCEPT_ALL);
     link.set_resource_started_callback(on_resource_started);
@@ -1229,6 +1447,174 @@ static void clear_roster() {
     log_event("leaf roster cleared (TOFU re-armed)");
 }
 
+// --- automatic TOFU re-arm for a pin that has gone dead ---------------------------------
+// A full `esptool write-flash 0x0` can wipe the leaf's NVS, and it comes back with a NEW
+// RNS identity — so a new destination hash AND a new slug, because the slug is derived
+// from the hash (leaf_radio.cpp: "leaf-%.8s"; no env defines LEAF_NODE_SLUG). The pin we
+// hold then names a leaf that will never speak again, and until a human POSTs /pin/clear
+// the entry sits in the roster forever: it holds a slot, it keeps advertising a phantom
+// camera, and on a full roster it locks the replacement out as FOREIGN entirely. That case
+// produced THREE identities from one physical board in an afternoon, so a 4-slot roster
+// reaches that deadlock after three reflashes of a single camera.
+//
+// WHY NOT THE ORIGINALLY PROPOSED BOUND. The first draft suggested "pinned identity never heard
+// direct this boot AND a new identity announces on the SAME slug". The same-slug conjunct
+// cannot ever be true in the scenario it was written for: the slug IS the first 8 hex of
+// the destination hash, so a regenerated identity always announces a different one. The
+// rule would never fire. It becomes the right rule the day slugs are operator-assigned
+// and survive a reflash; it is not the right rule today.
+//
+// The first conjunct is kept, but it is NECESSARY, not sufficient. "Never heard direct
+// this boot" is true of EVERY roster entry for the first seconds after a gateway reboot —
+// including the reboot this gateway's own announce-wedge watchdog performs — so on its own
+// it is most permissive exactly when the gateway knows least. Hence the extra bounds:
+//
+//   1. GRACE     — no re-arm in the first GW_TOFU_REARM_GRACE_MS of uptime. A leaf wakes
+//                  every few minutes; 30 min gives every live member many chances to prove
+//                  itself direct before we are willing to forget anything.
+//   2. SILENT    — the victim must be last_direct_ms == 0, i.e. not heard direct ONCE in
+//                  that whole window. A relayed announce does not save it, deliberately:
+//                  a relayed frame proves a radio somewhere, not this pin at this site.
+//   3. CORROBORATION — some OTHER trailcam.leaf identity must be provably alive here:
+//                  GW_TOFU_REARM_MIN_HEARD direct announces WITH a health tail, from one
+//                  hash, spanning at least GW_TOFU_REARM_MIN_SPAN_MS. This is the load-
+//                  bearing guard. It means we never forget a pin because WE went deaf —
+//                  a wedged radio, a snapped antenna and a dead site all fail this test,
+//                  and in every one of those the roster survives untouched.
+//   4. RATE      — one entry per event, oldest-silent first, at most
+//                  GW_TOFU_REARM_MAX_PER_BOOT per boot and GW_TOFU_REARM_COOLDOWN_MS
+//                  apart, so nobody walks the whole roster out in an afternoon.
+//
+// BLAST RADIUS, stated plainly, because this weakens TOFU on purpose:
+//   * When a slot is FREE this grants an attacker nothing new. Enrollment is already open
+//     for the roster's lifetime (that is how camera N+1 self-commissions), so a direct
+//     health announce already claims a slot today. Re-arm only garbage-collects the ghost.
+//   * When the roster is FULL it does grant something new: today a full roster refuses
+//     every newcomer, and after this a newcomer that holds the channel for
+//     GW_TOFU_REARM_MIN_SPAN_MS can displace a pin that has been silent for the whole
+//     grace window. The cost of that attack is: be within direct radio range of the site,
+//     emit a well-formed trailcam.leaf announce with a health tail N times over 10 minutes,
+//     and wait for one of the site's real cameras to already be off the air for 30 minutes.
+//     The reward is one roster slot — which buys command delivery for a camera slug that
+//     the SERVER must also already be addressing, and it is loudly logged, evented and
+//     beaten to the cloud at the moment it happens.
+//   * What it can NEVER do: evict an entry heard direct this boot, evict more than one
+//     entry per cooldown, or fire at all while the gateway's own receive path is broken.
+//
+// NOT COVERED, and the named-exit patch is the only defence: a leaf whose hash is UNCHANGED but whose
+// key material diverged (NVS identity survived, filesystem ratchet state did not). That
+// entry keeps announcing, keeps being heard direct, and keeps failing to decrypt. No
+// liveness rule can see it; only the leaf's own decrypt-failure line can.
+//
+// The knobs and state these functions read sit up beside the roster definition, because
+// web_root() renders them and is defined long before this point.
+
+// Called from the announce handler for every DIRECT announce carrying a health tail —
+// the same test TOFU enrollment itself uses, so nothing weaker can ever corroborate.
+static void tofu_note_live(const RNS::Bytes& destination_hash) {
+    if (destination_hash.size() != sizeof(s_live_hash)) return;
+    for (int i = 0; i < s_roster_n; i++) {
+        if (memcmp(destination_hash.data(), s_roster[i].pin,
+                   sizeof(s_roster[i].pin)) != 0) continue;
+        if (!s_roster[i].dh_n) s_roster[i].dh_first_ms = millis();
+        if (s_roster[i].dh_n < 255) s_roster[i].dh_n++;
+        return;
+    }
+    if (s_live_valid && memcmp(destination_hash.data(), s_live_hash,
+                               sizeof(s_live_hash)) == 0) {
+        if (s_live_heard < 255) s_live_heard++;
+        return;
+    }
+    memcpy(s_live_hash, destination_hash.data(), sizeof(s_live_hash));
+    s_live_heard    = 1;
+    s_live_first_ms = millis();
+    s_live_valid    = true;
+}
+
+// Is some leaf OTHER than `victim_pin` provably alive and audible right now? This is the
+// load-bearing guard: it is what stops the gateway forgetting a pin because IT went deaf.
+// A wedged radio, a snapped antenna and a dead site all fail it, and in every one of those
+// the roster survives untouched. Fills `out_hash` with the witness on success.
+static bool tofu_witness_ok(const uint8_t* victim_pin, uint8_t* out_hash,
+                            uint8_t* out_heard, uint32_t* out_span_ms) {
+    for (int i = 0; i < s_roster_n; i++) {
+        if (memcmp(s_roster[i].pin, victim_pin, sizeof(s_roster[i].pin)) == 0) continue;
+        if (s_roster[i].dh_n < GW_TOFU_REARM_MIN_HEARD) continue;
+        if (millis() - s_roster[i].dh_first_ms < GW_TOFU_REARM_MIN_SPAN_MS) continue;
+        memcpy(out_hash, s_roster[i].pin, sizeof(s_roster[i].pin));
+        *out_heard   = s_roster[i].dh_n;
+        *out_span_ms = millis() - s_roster[i].dh_first_ms;
+        return true;
+    }
+    if (s_live_valid && memcmp(s_live_hash, victim_pin, sizeof(s_live_hash)) != 0 &&
+        s_live_heard >= GW_TOFU_REARM_MIN_HEARD &&
+        millis() - s_live_first_ms >= GW_TOFU_REARM_MIN_SPAN_MS) {
+        memcpy(out_hash, s_live_hash, sizeof(s_live_hash));
+        *out_heard   = s_live_heard;
+        *out_span_ms = millis() - s_live_first_ms;
+        return true;
+    }
+    return false;
+}
+
+// Runs in loop(), never in packet dispatch: it rewrites the roster array and defers its
+// NVS write the same way enrollment does. Returns true if an entry was dropped.
+static bool tofu_rearm_scan() {
+    if (!s_roster_n) return false;
+    if (millis() < GW_TOFU_REARM_GRACE_MS) return false;
+    if (s_rearms_done >= GW_TOFU_REARM_MAX_PER_BOOT) return false;
+    if (s_last_rearm_ms && millis() - s_last_rearm_ms < GW_TOFU_REARM_COOLDOWN_MS)
+        return false;
+
+    int      victim = -1;
+    uint8_t  whash[16], wheard = 0;
+    uint32_t wspan = 0;
+    for (int i = 0; i < s_roster_n; i++) {
+        if (s_roster[i].last_direct_ms != 0) continue;   // heard direct -> alive, leave it
+        if (!tofu_witness_ok(s_roster[i].pin, whash, &wheard, &wspan)) continue;
+        victim = i;                                      // first silent entry wins
+        break;
+    }
+    if (victim < 0) return false;
+
+    char vhex[33], vslug[sizeof(s_roster[0].slug)], whex[9] = "????????";
+    snprintf(vhex,  sizeof(vhex),  "%s", s_roster[victim].hex);
+    snprintf(vslug, sizeof(vslug), "%s", s_roster[victim].slug);
+    for (int i = 0; i < 4; i++) sprintf(whex + i * 2, "%02x", whash[i]);
+    const bool was_full = (s_roster_n >= GW_ROSTER_MAX);
+
+    // Forget the pin, and the RNS path that goes with it — the pin IS the trailcam.leaf
+    // destination hash, so this is the same handle the announce-wedge watchdog drops.
+    {
+        RNS::Bytes h(s_roster[victim].pin, sizeof(s_roster[victim].pin));
+        if (RNS::Transport::has_path(h)) RNS::Transport::remove_path(h);
+    }
+    for (int i = victim; i < s_roster_n - 1; i++) s_roster[i] = s_roster[i + 1];
+    s_roster[s_roster_n - 1] = LeafEntry();
+    s_roster_n--;
+    s_rearms_done++;
+    s_last_rearm_ms    = millis();
+    s_pin_save_pending = true;      // NVS write happens in loop(), same as enrollment
+
+    Serial.printf("[gw] TOFU AUTO RE-ARM: dropped pin %s (%s) — never heard direct in "
+                  "%lus of uptime, while %s was heard direct+healthy %u times over %lus. "
+                  "Roster now %d/%d%s. This WEAKENS TOFU deliberately; "
+                  "POST /pin/clear is still the manual path.\n",
+                  vhex, vslug, (unsigned long)(millis() / 1000), whex,
+                  (unsigned)wheard, (unsigned long)(wspan / 1000),
+                  s_roster_n, GW_ROSTER_MAX,
+                  was_full ? " (roster had been FULL — this unblocked enrollment)" : "");
+    log_event("TOFU auto re-arm: dropped %.8s (%s), witness %s", vhex, vslug, whex);
+    queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
+               "\"extra\":{\"leaf_tofu_rearm\":{\"dropped\":\"%s\",\"slug\":\"%s\","
+               "\"witness\":\"%s\",\"witness_heard\":%u,\"witness_span_s\":%lu,"
+               "\"roster_was_full\":%s,\"roster_n\":%d,\"rearms_this_boot\":%u}}}",
+               gw_site(), gw_site(), vhex, vslug, whex, (unsigned)wheard,
+               (unsigned long)(wspan / 1000), was_full ? "true" : "false",
+               s_roster_n, (unsigned)s_rearms_done);
+    return true;
+}
+
 // Command-receipt acks (bug 8): the leaf announces "a=<id>,<id>" for server command
 // ids it received; we relay each to POST /commands/<id>/ack {"status":"received"} so
 // the server stops redelivering. Queued here (announce handler runs inside packet
@@ -1249,19 +1635,19 @@ static void queue_cmd_acks(const char* health_tail) {
 }
 
 static void post_cmd_acks() {
-    if (!s_cmd_ack_n || !net_up()) return;
+    if (!s_cmd_ack_n || !net_up() || !gw_provisioned()) return;
     WiFiClientSecure tls;
     tls.setInsecure();
     HTTPClient http;
     http.setConnectTimeout(6000);
     http.setTimeout(8000);
     for (int i = 0; i < s_cmd_ack_n; i++) {
-        String url = String(GW_INGEST_URL);
+        String url = String(gw_url());
         char path[40];
         snprintf(path, sizeof(path), "/commands/%lu/ack", (unsigned long)s_cmd_acks[i]);
         url.replace("/ingest", path);
         if (!http.begin(tls, url)) break;
-        http.addHeader("Authorization", "Bearer " GW_INGEST_TOKEN);
+        http.addHeader("Authorization", String("Bearer ") + gw_token());
         http.addHeader("Content-Type", "application/json");
         static const char* body = "{\"status\":\"received\",\"detail\":\"leaf ack via announce\"}";
         int code = http.POST((uint8_t*)body, strlen(body));
@@ -1273,19 +1659,26 @@ static void post_cmd_acks() {
     s_cmd_ack_n = 0;   // fire-and-forget: redelivery re-acks if one was lost
 }
 
-// Pull the "n=<slug>" token out of an announce tail (leaf-0.13.0). Token-boundary
-// aware: matches only at the tail start or right after a space, so a slug can never
-// be faked by a substring of another token. Returns false if absent (older leaves).
-static bool htail_slug(const char* htail, char* out, size_t cap) {
+// Pull a "<key>=<value>" token out of an announce tail. Token-boundary aware: matches
+// only at the tail start or right after a space, so a value can never be faked by a
+// substring of another token — "tx=20" must not answer a lookup for "x=". Returns false
+// if the key is absent (older leaves send shorter tails).
+static bool htail_token(const char* htail, const char* key, char* out, size_t cap) {
+    const size_t klen = strlen(key);
     for (const char* p = htail; p; p = strchr(p, ' '), p = p ? p + 1 : nullptr) {
-        if (strncmp(p, "n=", 2) != 0) continue;
-        p += 2;
+        if (strncmp(p, key, klen) != 0) continue;
+        p += klen;
         size_t i = 0;
         while (p[i] && p[i] != ' ' && i + 1 < cap) { out[i] = p[i]; i++; }
         out[i] = '\0';
         return i > 0;
     }
     return false;
+}
+
+// The node slug ("n=<slug>", leaf-0.13.0).
+static bool htail_slug(const char* htail, char* out, size_t cap) {
+    return htail_token(htail, "n=", out, cap);
 }
 
 class LeafAnnounceHandler : public RNS::AnnounceHandler {
@@ -1316,6 +1709,12 @@ public:
         if (!direct) s_stats.announces_relayed++;   // wedge watchdog, so count ALL
         // --- roster membership (bug 7): is this announce from a leaf WE manage? ----
         const bool has_health = strstr(htail, "p=") && strstr(htail, "c=");
+        // Corroboration for the TOFU auto re-arm: a direct announce with a
+        // health tail is proof that our receive path and this site's radio both work.
+        // Recorded for EVERY such announce, roster member or not, and before the roster
+        // lookup below — the replacement leaf on a one-camera site is foreign at first
+        // and is the only witness that will ever exist there.
+        if (direct && has_health) tofu_note_live(destination_hash);
         int idx = -1;
         if (destination_hash.size() == sizeof(s_roster[0].pin)) {
             for (int i = 0; i < s_roster_n; i++)
@@ -1336,7 +1735,7 @@ public:
                 log_event("leaf %d pinned %.8s", idx, s_roster[idx].hex);
                 queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
                            "\"extra\":{\"leaf_pinned\":{\"hash\":\"%s\",\"slot\":%d}}}",
-                           GW_SITE, GW_SITE, s_roster[idx].hex, idx);
+                           gw_site(), gw_site(), s_roster[idx].hex, idx);
             }
         }
         if (idx < 0) {
@@ -1359,7 +1758,7 @@ public:
             queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
                        "\"extra\":{\"foreign_announce\":{\"hash\":\"%s\","
                        "\"status\":\"%s\",\"hops\":%u%s}}}",
-                       GW_SITE, GW_SITE, fh, status,
+                       gw_site(), gw_site(), fh, status,
                        (unsigned)LoRaInterface::last_hops, opt);
             return;
         }
@@ -1387,6 +1786,7 @@ public:
                 snprintf(L.slug, sizeof(L.slug), "%s", slug);
             }
         }
+        L.announce_ms = millis();   // send-delay probe: dispatch instant
         L.announced = true;   // loop() delivers — not from inside packet dispatch
         if (direct) L.last_direct_ms = millis();
         Serial.printf("[gw] leaf %d announce heard (%s)%s%s%s\n", idx, status,
@@ -1427,6 +1827,11 @@ public:
         // fixes it, an RMA does not), "sd=?" degraded, cause not separable. The field is
         // ABSENT on a healthy leaf, so its presence alone is the alarm.
         char sdkv[24] = "";
+        // Identity-change alarm: "x=<the slug this leaf announced under before
+        // its NVS key was lost>" -> extra.prev_node. Absent on a healthy node, so its
+        // presence alone is the alarm; the server uses it to merge the split camera row.
+        // Bounded burst per power cycle at the leaf, so this is not a steady-state field.
+        char prevkv[48] = "";
         if (htail[0]) {
             long p = -1, c = -1, f = -1;
             float vb = NAN;
@@ -1439,6 +1844,15 @@ public:
                 snprintf(txkv, sizeof(txkv), ",\"tx_dbm\":%ld", atol(t + 3));
             if ((t = strstr(htail, "sd=")) && t[3] && t[3] != ' ')
                 snprintf(sdkv, sizeof(sdkv), ",\"sd\":\"%c\"", t[3]);
+            char prevslug[24], nowslug[24];
+            if (htail_token(htail, "x=", prevslug, sizeof(prevslug))) {
+                snprintf(prevkv, sizeof(prevkv), ",\"prev_node\":\"%s\"", prevslug);
+                if (!htail_slug(htail, nowslug, sizeof(nowslug)))
+                    snprintf(nowslug, sizeof(nowslug), "a leaf");
+                Serial.printf("[gw] *** %s reports an IDENTITY CHANGE: it used to be %s "
+                              "(its history and its queued commands are split) ***\n",
+                              nowslug, prevslug);
+            }
             // Only leaves that actually sent the health counters get a health object
             // (a tail can now be just "n=<slug> tx=<dbm>").
             if (p >= 0 || c >= 0 || f >= 0) {
@@ -1454,34 +1868,34 @@ public:
         }
         if (isnan(LoRaInterface::last_rssi))
             queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\"%s,"
-                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s%s%s,"
+                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s%s%s%s,"
                        "\"packet\":{\"len\":%u,\"hex\":\"%s\"}}}",
-                       GW_SITE, L.slug[0] ? L.slug : gw_fallback_camera(), batt, status,
-                       (unsigned)LoRaInterface::last_hops, health, txkv, sdkv,
+                       gw_site(), L.slug[0] ? L.slug : gw_fallback_camera(), batt, status,
+                       (unsigned)LoRaInterface::last_hops, health, txkv, sdkv, prevkv,
                        (unsigned)LoRaInterface::last_frame_len, hexbuf);
         else
             queue_beat("{\"site\":\"%s\",\"node\":\"%s\",\"kind\":\"camera\"%s,"
                        "\"rssi\":%.0f,\"snr\":%.1f,"
-                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s%s%s,"
+                       "\"extra\":{\"status\":\"%s\",\"via\":\"mesh\",\"hops\":%u%s%s%s%s,"
                        "\"packet\":{\"len\":%u,\"hex\":\"%s\"}}}",
-                       GW_SITE, L.slug[0] ? L.slug : gw_fallback_camera(), batt,
+                       gw_site(), L.slug[0] ? L.slug : gw_fallback_camera(), batt,
                        LoRaInterface::last_rssi, LoRaInterface::last_snr, status,
-                       (unsigned)LoRaInterface::last_hops, health, txkv, sdkv,
+                       (unsigned)LoRaInterface::last_hops, health, txkv, sdkv, prevkv,
                        (unsigned)LoRaInterface::last_frame_len, hexbuf);
     }
 };
 
 static void poll_commands() {
-    if (!net_up()) return;
+    if (!net_up() || !gw_provisioned()) return;
     WiFiClientSecure tls;
     tls.setInsecure();
     HTTPClient http;
     http.setConnectTimeout(8000);
     http.setTimeout(10000);
-    String url = String(GW_INGEST_URL);
+    String url = String(gw_url());
     url.replace("/ingest", "/commands");
     if (!http.begin(tls, url)) return;
-    http.addHeader("Authorization", "Bearer " GW_INGEST_TOKEN);
+    http.addHeader("Authorization", String("Bearer ") + gw_token());
     int code = http.GET();
     if (code != 200) { http.end(); return; }
     String body = http.getString();
@@ -1518,6 +1932,50 @@ static void poll_commands() {
     }
 }
 
+// Strip the server-only fields off a command before it goes on the air.
+//
+// The /commands contract is server-facing: it carries "site", "node" and "status" for the
+// GATEWAY's benefit, and the leaf parses NONE of them (leaf_serial_proto.cpp reads
+// kind/event_id/quality/ssid/psk/url/sha256/minutes/confirm, plus "id" for the ack).
+// Those spectators cost real air. A maintenance command measured 167 B of JSON, which with
+// the ~106 B of RNS overhead measured on board 0016 is ~273 B — past the 255 B PHY frame,
+// so it split in two. Measured: the 255 B first part arrives and is buffered for
+// reassembly, the second never lands inside the leaf's 2500 ms window, reassembly never
+// completes, and the command is lost with no log anywhere. Single-frame traffic (time_sync,
+// 58 B) arrived every time.
+//
+// Emitting only what the leaf reads takes that command to ~94 B, comfortably one frame.
+// This does NOT make large commands safe: update_firmware carries a url plus a 64-hex
+// sha256 and will still split, so the reassembly path needs its own fix before OTA works.
+static void trim_cmd_for_air(const char* in, char* out, size_t cap) {
+    out[0] = 0;
+    char kind[32] = "";
+    json_str(in, "kind", kind, sizeof(kind));
+    if (!kind[0]) return;                       // unrecognisable -> caller sends it verbatim
+    const long long id = json_ll(in, "id");
+    char payload[320] = "";
+    const char* pl = strstr(in, "\"payload\"");
+    if (pl) {
+        const char* b = strchr(pl, '{');
+        if (b) {
+            int depth = 0;
+            const char* e = b;
+            for (; *e; e++) {
+                if (*e == '{') depth++;
+                else if (*e == '}') { depth--; if (!depth) { e++; break; } }
+            }
+            size_t n = (size_t)(e - b);
+            if (n && n < sizeof(payload)) { memcpy(payload, b, n); payload[n] = 0; }
+        }
+    }
+    char eid[64] = "";
+    json_str(in, "event_id", eid, sizeof(eid));   // null/absent -> empty -> omitted
+    snprintf(out, cap, "{\"id\":%lld,\"kind\":\"%s\"%s%s%s%s%s}",
+             id, kind,
+             eid[0] ? ",\"event_id\":\"" : "", eid[0] ? eid : "", eid[0] ? "\"" : "",
+             payload[0] ? ",\"payload\":" : "", payload[0] ? payload : "");
+}
+
 static int deliver_pending_commands(LeafEntry& L) {
     if (!L.identity) return 0;
     RNS::Destination leaf_dest(L.identity, RNS::Type::Destination::OUT,
@@ -1539,8 +1997,24 @@ static int deliver_pending_commands(LeafEntry& L) {
             continue;
         }
         if (c.last_sent && millis() - c.last_sent < GW_CMD_SUPPRESS_SECS * 1000u) continue;
-        RNS::Packet pkt(leaf_dest, RNS::Bytes((const uint8_t*)c.json, strlen(c.json)));
+        // Trim server-only fields so an ordinary command fits one PHY frame.
+        char air[512];
+        trim_cmd_for_air(c.json, air, sizeof(air));
+        const char* wire = air[0] ? air : c.json;
+        RNS::Packet pkt(leaf_dest, RNS::Bytes((const uint8_t*)wire, strlen(wire)));
+        const uint32_t t_send = millis();
         pkt.send();
+        // Send-delay probe. The one number the passive sniffer could not give: how long
+        // after dispatch heard the announce did this packet actually leave, and how
+        // big was it. Pair with the leaf's "[cmd-probe] enter" line to tell
+        // never-sent from outside-the-window from arrived-and-rejected.
+        Serial.printf("[cmd-probe] TX t=%lu dispatch+%lums to=%s len=%u json=%.72s\n",
+                      (unsigned long)t_send,
+                      (unsigned long)(L.announce_ms ? t_send - L.announce_ms : 0),
+                      L.slug[0] ? L.slug : "?", (unsigned)strlen(wire), wire);
+        log_event("cmd-probe TX dispatch+%lums to %s len %u",
+                  (unsigned long)(L.announce_ms ? t_send - L.announce_ms : 0),
+                  L.slug[0] ? L.slug : "?", (unsigned)strlen(wire));
         c.last_sent = millis();
         sent++;
     }
@@ -1651,6 +2125,23 @@ static void maybe_time_sync(LeafEntry& L) {
 #define GW_RF_GRANT_TTL_S         (24 * 3600)      // matches the leaf's default
 #define GW_RF_SCAN_SILENT_MS      (90 * 1000u)     // leaf quiet this long off-base -> scan
 #define GW_RF_SCAN_TOGGLE_MS      (30 * 1000u)
+// Walk-back shepherd: the multi-leaf walk-back grants base to whichever member
+// is announcing right now — but a member asleep through that moment still holds the old
+// rung, and a gateway parked on base can never hear it again (no commands, no PIR alert
+// pushes) until the leaf's own contactless-wake safety reverts it: that check runs at
+// wake-BEGIN after LEAF_RF_SILENT_WAKES_MAX=3 silent wakes, i.e. the 4th wake — up to
+// ~8 h at the 2 h field night cadence. So after a walk-back, alternate between base and
+// the vacated rung (same cadence and busy-gates as the quiet-leaf scan); the walk-back
+// branch itself delivers the base grant into the RX window of anything caught there,
+// the leaf live-retunes and confirms ON BASE, and that confirm ends the wait for it.
+// Deadline reasoning: at the slowest cadence the sweep sees the incumbent's announce
+// twice inside 4 h, each a ~50% catch (30 s alternation, random phase) plus an active
+// delivery — past that, the leaf's own revert is at most one wake out, and alternating
+// longer only costs the base-resident members announces. No per-leaf cadence
+// prediction on purpose: PIR wakes randomize the schedule, a mispredicted park is
+// strictly worse than the coin flip.
+#define GW_RF_SHEPHERD_MAX_MS     (4 * 3600 * 1000u)
+#define GW_RF_SHEPHERD_GRACE_MS   (60 * 1000u)     // base-heard this recently = not owed
 
 // ADR stepping is confined to ONE profile family, because the table stopped being
 // monotonically ordered when the certified ladder was appended (lora_profiles.h,
@@ -1684,7 +2175,7 @@ static void rf_beat(const char* event, uint8_t idx, float snr, float rssi,
     // gateway; they were only ever filed under a camera because a node string was needed.
     queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
                "\"extra\":{\"rf\":{\"event\":\"%s\",\"profile\":\"%s\",\"idx\":%u%s}}}",
-               GW_SITE, GW_SITE, event, rf_name(idx), (unsigned)idx, opt);
+               gw_site(), gw_site(), event, rf_name(idx), (unsigned)idx, opt);
 }
 
 static void rf_send_grant(const RNS::Identity& leaf_id, uint8_t idx) {
@@ -1698,6 +2189,40 @@ static void rf_send_grant(const RNS::Identity& leaf_id, uint8_t idx) {
     pkt.send();
     s_rf.last_grant_tx_ms   = millis();
     s_rf.announces_since_tx = 0;
+}
+
+// Start (or refresh) the walk-back shepherd for a vacated rung. Owed = every
+// roster member not heard on base just now — the member whose announce triggered the
+// walk-back was marked base-heard moments ago (when it announced on base) or is being
+// handed the grant right now (when it announced on the stray rung), so the grace
+// window sorts the two without special-casing the caller's L.
+static void shepherd_arm(uint8_t stray_rung) {
+    int owed = 0;
+    for (int i = 0; i < s_roster_n; i++) {
+        LeafEntry& e = s_roster[i];
+        e.shep_wait = !(e.base_heard_ms &&
+                        millis() - e.base_heard_ms < GW_RF_SHEPHERD_GRACE_MS);
+        if (e.shep_wait) owed++;
+    }
+    if (!owed) return;
+    s_rf.shep_rung      = stray_rung;
+    s_rf.shep_start_ms  = millis();
+    s_rf.shep_toggle_ms = millis();
+    Serial.printf("[gw] ADR: SHEPHERD start — %d roster member(s) may still hold %s, "
+                  "sweeping it against base for up to %lu min\n",
+                  owed, rf_name(stray_rung),
+                  (unsigned long)(GW_RF_SHEPHERD_MAX_MS / 60000u));
+    log_event("ADR shepherd start: %d owed on %s", owed, rf_name(stray_rung));
+    rf_beat("shepherd_start", stray_rung, NAN, NAN, NAN);
+}
+
+static void shepherd_end(const char* why) {
+    Serial.printf("[gw] ADR: SHEPHERD end (%s) after %lu min\n", why,
+                  (unsigned long)((millis() - s_rf.shep_start_ms) / 60000u));
+    log_event("ADR shepherd end: %s", why);
+    rf_beat("shepherd_end", s_rf.shep_rung, NAN, NAN, NAN);
+    s_rf.shep_rung = 0xFF;
+    for (int i = 0; i < s_roster_n; i++) s_roster[i].shep_wait = false;
 }
 
 // On every DIRECT leaf announce, BEFORE command delivery: settle any in-flight state.
@@ -1722,9 +2247,17 @@ static void rf_on_leaf_announce(bool direct) {
     if (s_rf.scanning) {
         // Scan found the leaf on whatever we're parked on — adopt that as the truth
         // (usually base: the leaf power-cycled and its RTC grant wiped).
+        const uint8_t abandoned = s_rf.granted;   // the rung the adopt walks away from
         s_rf.scanning = false;
         s_rf.granted  = s_rf.current;
         rf_persist(s_rf.granted);
+        // A multi-leaf adopt-to-base is a walk-back by another door — the
+        // reboot-mid-install path (boot scan-first, bug 2) converges HERE, not in the
+        // walk-back branch, and the member still out on the old NVS rung would be
+        // just as stranded. Same shepherd, same exit evidence.
+        if (s_roster_n > 1 && abandoned != s_rf.granted &&
+            abandoned != LORA_PROFILE_BASE && s_rf.shep_rung == 0xFF)
+            shepherd_arm(abandoned);
         rf_clear_snr();
         Serial.printf("[gw] ADR: scan found the leaf on %s -> adopted\n",
                       rf_name(s_rf.granted));
@@ -1741,16 +2274,23 @@ static void rf_on_leaf_announce(bool direct) {
 // After command delivery on an announce: decide whether to move the leaf. cmds_sent
 // gates the grant — a leaf busy executing a fetch_full must not have the PHY yanked
 // from under the transfer it's about to start.
-static void maybe_grant_profile(LeafEntry& L, int cmds_sent) {
-    if (!L.identity || s_rf.pending != 0xFF) return;
+// Returns TRUE if this call PUT A FRAME ON AIR (grant, walk-back or keepalive), so the
+// caller can keep the rest of the downlink out of the way — see the note at the
+// call site. Every early return means "sent nothing".
+static bool maybe_grant_profile(LeafEntry& L, int cmds_sent) {
+    if (!L.identity || s_rf.pending != 0xFF) return false;
     // Multi-leaf site (gateway-0.10.0): everyone lives on BASE. One radio can't serve
     // two leaves on different profiles, and a fast site profile makes a newly added
     // leaf invisible (it boots on base while we camp off-base — its hello is never
     // heard). Any standing grant gets actively walked back: tell whichever member is
-    // announcing right now "base" and adopt base ourselves immediately; members still
-    // holding the old grant self-revert within 3 contactless wakes (leaf ADR safety).
+    // announcing right now "base" and adopt base ourselves immediately. Members asleep
+    // through this moment still hold the old rung — the shepherd (armed below)
+    // sweeps that rung so THIS branch can catch their next announce there and hand
+    // them the same grant, instead of leaving them deaf until the leaf's own
+    // contactless-wake safety reverts them (the 4th wake, ~8 h at night cadence).
     if (s_roster_n > 1) {
         if (s_rf.granted != LORA_PROFILE_BASE || s_rf.current != LORA_PROFILE_BASE) {
+            const uint8_t stray = s_rf.granted;   // the rung members may still hold
             rf_send_grant(L.identity, LORA_PROFILE_BASE);
             rf_retune(LORA_PROFILE_BASE);
             s_rf.granted  = LORA_PROFILE_BASE;
@@ -1762,15 +2302,21 @@ static void maybe_grant_profile(LeafEntry& L, int cmds_sent) {
                           rf_name(LORA_PROFILE_BASE));
             log_event("ADR: multi-leaf -> base, grants suspended");
             rf_beat("multi_leaf_base", LORA_PROFILE_BASE, NAN, NAN, NAN);
+            // stray == BASE here means granted was already walked back and we were
+            // merely parked off-base (the shepherd's own sweep park) — the shepherd
+            // that put us there stays armed; nothing new was vacated.
+            if (stray != LORA_PROFILE_BASE && s_rf.shep_rung == 0xFF)
+                shepherd_arm(stray);
+            return true;
         }
-        return;
+        return false;
     }
     // Operator hold: parked on base for surveying/commissioning — no grants, no
     // keepalives, just listen. (Sits after the multi-leaf walk-back on purpose: a
     // member still holding an old grant gets actively told "base" even mid-hold.)
-    if (rf_hold_active()) return;
-    if (s_rf.scanning) return;
-    if (cmds_sent || asm_active()) return;   // transfer imminent or in progress
+    if (rf_hold_active()) return false;
+    if (s_rf.scanning) return false;
+    if (cmds_sent || asm_active()) return false;   // transfer imminent or in progress
     // Keepalive refresh of a standing off-base grant. The leaf treats ANY packet from
     // us as proof we still hear it and reverts to base after 3 contactless wakes — but
     // an idle leaf gets no traffic at all (commands/time_sync are occasional), so a
@@ -1781,11 +2327,11 @@ static void maybe_grant_profile(LeafEntry& L, int cmds_sent) {
     if (s_rf.granted != LORA_PROFILE_BASE && s_rf.announces_since_tx >= 2) {
         rf_send_grant(L.identity, s_rf.granted);
         Serial.printf("[gw] ADR: grant keepalive (%s)\n", rf_name(s_rf.granted));
-        return;
+        return true;
     }
     if (s_rf.last_switch_ms && millis() - s_rf.last_switch_ms < GW_RF_SWITCH_COOLDOWN_MS)
-        return;
-    if (s_rf.snr_n < GW_RF_SNR_SAMPLES_MIN) return;
+        return false;
+    if (s_rf.snr_n < GW_RF_SNR_SAMPLES_MIN) return false;
     const float   snr    = rf_avg_snr();
     const float   rssi   = rf_avg_rssi();
     // Derate the (strong) uplink reading into a downlink estimate — the grant governs
@@ -1812,7 +2358,7 @@ static void maybe_grant_profile(LeafEntry& L, int cmds_sent) {
             headroom = (rssi_hr < snr_hr) ? rssi_hr : snr_hr;   // the binding margin
         }
     }
-    if (want == cur) return;
+    if (want == cur) return false;
     Serial.printf("[gw] ADR: granting %s (rssi %.0f dl_est %.0f snr %.1f, "
                   "headroom %.1f dB) -> retuning\n",
                   rf_name(want), rssi, dl_est, snr, headroom);
@@ -1825,6 +2371,7 @@ static void maybe_grant_profile(LeafEntry& L, int cmds_sent) {
     s_rf.last_switch_ms = millis();
     rf_retune(want);   // follow our own grant; the leaf confirms here or we revert
     rf_clear_snr();    // SNR history doesn't transfer across profiles (BW noise floor)
+    return true;
 }
 
 // --- announce-starvation watchdog (bug 6, root-caused 2026-07-16) -----------------------
@@ -1879,7 +2426,7 @@ static void announce_wedge_watchdog() {
               (unsigned)GW_ANN_WEDGE_REBOOT_AT);
     queue_beat("{\"site\":\"%s\",\"node\":\"gw-%s\",\"kind\":\"gateway\","
                "\"extra\":{\"announce_wedge\":{\"seen\":%lu,\"silent_s\":%lu,\"fires\":%u}}}",
-               GW_SITE, GW_SITE,
+               gw_site(), gw_site(),
                (unsigned long)(LoRaInterface::announces_seen - seen_baseline),
                (unsigned long)((millis() - baseline_ms) / 1000),
                (unsigned)consecutive_fires);
@@ -1954,6 +2501,35 @@ static void rf_loop() {
         Serial.printf("[gw] ADR: leaf quiet %lus -> scanning on %s\n",
                       (unsigned long)((millis() - s_rf.last_leaf_ms) / 1000),
                       rf_name(park));
+    }
+    // Walk-back shepherd: sweep the vacated rung for members that slept
+    // through the walk-back. The multi-leaf branch in maybe_grant_profile() is the
+    // delivery arm — anything caught announcing on the swept rung gets the base grant
+    // in its RX window and confirms on base seconds later, which clears its debt.
+    // Exit the moment nobody is owed, on the hard deadline (the leaf's own
+    // contactless-wake revert is at most one wake out by then), or if the site stops
+    // being multi-leaf (single-leaf ADR takes back over). Same busy-gates as the
+    // scan: never retune off a live transfer.
+    if (s_rf.shep_rung != 0xFF) {
+        bool owed = false;
+        for (int i = 0; i < s_roster_n; i++) owed |= s_roster[i].shep_wait;
+        const bool busy = radio_busy() || asm_active();
+        if (!owed || s_roster_n <= 1 ||
+            millis() - s_rf.shep_start_ms > GW_RF_SHEPHERD_MAX_MS) {
+            if (s_rf.current == LORA_PROFILE_BASE || !busy) {
+                shepherd_end(!owed          ? "all members heard on base"
+                             : s_roster_n <= 1 ? "roster no longer multi-leaf"
+                                               : "deadline, leaf self-revert finishes");
+                if (s_rf.current != LORA_PROFILE_BASE) rf_retune(LORA_PROFILE_BASE);
+            }
+        } else if (s_rf.pending == 0xFF && !busy && !rf_hold_active() &&
+                   millis() - s_rf.shep_toggle_ms > GW_RF_SCAN_TOGGLE_MS) {
+            s_rf.shep_toggle_ms = millis();
+            const uint8_t park = (s_rf.current == LORA_PROFILE_BASE) ? s_rf.shep_rung
+                                                                     : LORA_PROFILE_BASE;
+            rf_retune(park);
+            Serial.printf("[gw] ADR: shepherd sweep -> %s\n", rf_name(park));
+        }
     }
 }
 
@@ -2031,6 +2607,10 @@ static void eth_begin() {
 // is still open; see homelab docs/trailcam/gateway-provisioning.md.
 struct WifiCred { const char* ssid; const char* psk; };
 static const WifiCred WIFI_BAKED[] = {
+// The portal bench rig (heltec-v3-portal-bench) boots with an EMPTY baked list so it
+// lands in PROVISION and raises the AP. A -U flag cannot do this any more — the
+// credentials arrive via gw_secrets.h, and -U only undoes command-line -D.
+#if !defined(GW_PORTAL_BENCH)
 #if defined(GW_WIFI_SSID) && defined(GW_WIFI_PSK)
     { GW_WIFI_SSID,  GW_WIFI_PSK  },
 #endif
@@ -2040,6 +2620,7 @@ static const WifiCred WIFI_BAKED[] = {
 #if defined(GW_WIFI_SSID3) && defined(GW_WIFI_PSK3)
     { GW_WIFI_SSID3, GW_WIFI_PSK3 },
 #endif
+#endif  // !GW_PORTAL_BENCH
     { nullptr, nullptr },   // terminator: a zero-length array is illegal, and a consumer
 };                          // build legitimately bakes nothing at all
 static const size_t WIFI_BAKED_COUNT = (sizeof(WIFI_BAKED) / sizeof(WIFI_BAKED[0])) - 1;
@@ -2047,13 +2628,39 @@ static const size_t WIFI_BAKED_COUNT = (sizeof(WIFI_BAKED) / sizeof(WIFI_BAKED[0
 static char s_nvs_ssid[33] = "";    // 32 + NUL
 static char s_nvs_psk[64]  = "";    // WPA2 PSK max 63 + NUL
 
+// Has the provisioned credential EVER associated? Persisted, because it is the
+// difference between the two failures that look identical from inside the box:
+//
+//   never worked   -> the passphrase is almost certainly a typo, and on a sealed
+//                     consumer unit with no ethernet and no serial that is a brick.
+//                     Re-open the portal (portal_rescue_due()) so it can be corrected.
+//   worked before  -> the router is down, moved, or renamed. NOT a reason to raise an
+//                     open AP in someone's house; the box just keeps retrying. That is
+//                     the "don't resurrect on a later WiFi drop" rule in
+//                     homelab docs/trailcam/gateway-provisioning.md.
+static bool s_nvs_cred_ok = false;
+
 static void net_creds_load() {
     Preferences p;
     p.begin("gateway", /*readOnly=*/true);
     p.getString("wifi_ssid", s_nvs_ssid, sizeof(s_nvs_ssid));
     p.getString("wifi_psk",  s_nvs_psk,  sizeof(s_nvs_psk));
+    s_nvs_cred_ok = p.getBool("wifi_ok", false);
     p.end();
-    if (s_nvs_ssid[0]) Serial.printf("[gw] provisioned WiFi network: \"%s\"\n", s_nvs_ssid);
+    if (s_nvs_ssid[0])
+        Serial.printf("[gw] provisioned WiFi network: \"%s\" (%s)\n",
+                      s_nvs_ssid, s_nvs_cred_ok ? "proven" : "never associated yet");
+}
+// One NVS write, the first time a provisioned credential actually associates. Idempotent
+// so the reconnect path can call it freely.
+static void net_creds_mark_ok() {
+    if (s_nvs_cred_ok || !s_nvs_ssid[0]) return;
+    s_nvs_cred_ok = true;
+    Preferences p;
+    p.begin("gateway", /*readOnly=*/false);
+    p.putBool("wifi_ok", true);
+    p.end();
+    Serial.printf("[gw] credential for \"%s\" proven on air\n", s_nvs_ssid);
 }
 // Returns false and changes nothing on a malformed SSID — a provisioning front-end must be
 // able to reject bad input without having already clobbered a working credential.
@@ -2068,7 +2675,9 @@ static bool net_creds_save(const char* ssid, const char* psk) {
     p.begin("gateway", /*readOnly=*/false);
     p.putString("wifi_ssid", ssid);
     p.putString("wifi_psk",  psk);
+    p.putBool("wifi_ok", false);   // a NEW credential is unproven until it associates
     p.end();
+    s_nvs_cred_ok = false;
     strlcpy(s_nvs_ssid, ssid, sizeof(s_nvs_ssid));
     strlcpy(s_nvs_psk,  psk,  sizeof(s_nvs_psk));
     Serial.printf("[gw] WiFi credential stored for \"%s\"\n", ssid);
@@ -2083,9 +2692,11 @@ static void net_creds_clear() {
     p.begin("gateway", /*readOnly=*/false);
     p.remove("wifi_ssid");
     p.remove("wifi_psk");
+    p.remove("wifi_ok");
     p.end();
     s_nvs_ssid[0] = 0;
     s_nvs_psk[0]  = 0;
+    s_nvs_cred_ok = false;
     Serial.println("[gw] provisioned WiFi credential erased");
 }
 static size_t net_cred_count() { return WIFI_BAKED_COUNT + (s_nvs_ssid[0] ? 1 : 0); }
@@ -2113,13 +2724,21 @@ static size_t s_wifi_idx = 0;   // which network we're currently attempting
 // watching nothing happen for 15 s will reasonably conclude it did not take.
 static uint32_t s_wifi_last_try = 0;
 
+// How many association attempts this credential set has burned without ever connecting.
+// Zeroed on a successful association and by net_creds_changed(); read by the portal's
+// rescue trigger, which is the only thing that cares.
+static uint8_t s_wifi_fails = 0;
+
 static void wifi_ensure() {
     if (WiFi.status() == WL_CONNECTED) return;
     const size_t n_nets = net_cred_count();
     if (n_nets == 0) return;
     if (s_wifi_last_try && millis() - s_wifi_last_try < GW_WIFI_TRY_MS) return;
     // The current network didn't associate in its window -> rotate to the next one.
-    if (s_wifi_last_try && n_nets > 1) s_wifi_idx = (s_wifi_idx + 1) % n_nets;
+    if (s_wifi_last_try) {
+        if (s_wifi_fails < 255) s_wifi_fails++;
+        if (n_nets > 1) s_wifi_idx = (s_wifi_idx + 1) % n_nets;
+    }
     if (s_wifi_idx >= n_nets) s_wifi_idx = 0;   // a save/clear can shrink the list under us
     s_wifi_last_try = millis();
     const WifiCred n = net_cred_at(s_wifi_idx);
@@ -2140,7 +2759,16 @@ static void wifi_ensure() {
     // ONCE; every later call, including the very next rotation, still runs it.
     static bool s_wifi_driver_up = false;
     if (s_wifi_driver_up) WiFi.disconnect(true);
+    // disconnect(true) only clears the STA bit, so the SoftAP survives it, but mode()
+    // would not — hence AP_STA while the provisioning portal is live. That combination
+    // is what lets the rescue portal keep retrying the stored credential underneath
+    // itself: a router that merely came back late closes the portal with nobody
+    // touching the box.
+#ifdef GW_HAS_PORTAL
+    WiFi.mode(s_portal_up ? WIFI_AP_STA : WIFI_STA);
+#else
     WiFi.mode(WIFI_STA);
+#endif
     WiFi.begin(n.ssid, n.psk);
     s_wifi_driver_up = true;
 }
@@ -2195,7 +2823,21 @@ static void net_select_restart() {
 #endif
 }
 
-static void net_ensure();   // net_setup runs one tick immediately
+#ifdef GW_HAS_PORTAL
+static void portal_sync();   // start/stop the SoftAP to match the state we just landed in
+static void portal_loop();   // pump the captive DNS while it is up
+#else
+static inline void portal_sync() {}
+static inline void portal_loop() {}
+#endif
+
+static void net_select_tick();   // the selector proper; net_ensure() is the wrapper below
+
+// One selector tick, then whatever the resulting state implies for the provisioning
+// portal. Every caller goes through this (setup, loop, net_creds_changed), so no path
+// can change state and leave a SoftAP running behind it. That matters most for the
+// ethernet preempt, which returns early from the tick from any state, PROVISION included.
+static void net_ensure() { net_select_tick(); portal_sync(); }
 
 static void net_setup() {
 #ifdef GW_NET_HAS_WIFI
@@ -2216,7 +2858,7 @@ static void net_setup() {
     net_ensure();   // a WiFi-only box associates immediately, exactly as it always has
 }
 
-static void net_ensure() {
+static void net_select_tick() {
 #ifdef GW_NET_HAS_ETH
     // Ethernet PREEMPTS in every state: it is strictly cheaper than WiFi, so a link that
     // shows up late (switch finished booting, someone plugged the cable in) takes over.
@@ -2279,6 +2921,12 @@ static void net_ensure() {
         if (WiFi.status() == WL_CONNECTED) {
             s_net_active = NET_IFACE_WIFI;
             s_net_state  = NET_ST_UP;
+            s_wifi_fails = 0;
+            // Pointer equality, not a string compare: net_cred_at() hands back
+            // s_nvs_ssid itself for the provisioned entry, so this asks "did the
+            // credential somebody typed in just work", not "does some baked entry
+            // happen to share the name".
+            if (net_cred_at(s_wifi_idx).ssid == s_nvs_ssid) net_creds_mark_ok();
             break;
         }
         if (net_cred_count() == 0) { s_net_state = NET_ST_PROVISION; s_net_t0 = millis(); break; }
@@ -2289,11 +2937,12 @@ static void net_ensure() {
         // Credentials can appear while we sit here (that is the whole point), so re-check
         // and leave the moment there is something to try.
         if (net_cred_count() > 0) { s_net_state = NET_ST_WAIT_WIFI; s_net_t0 = millis(); break; }
-        // TODO: start the chosen provisioning front-end here. The credential sink
-        // (net_creds_save) and this state both exist; only the UX is undecided — SoftAP
-        // captive portal vs. mesh config downlink vs. serial/QR at kitting. Options and
-        // recommendation: homelab docs/trailcam/gateway-provisioning.md. Until one lands,
-        // the box says so on a slow beat rather than looking silently wedged.
+        // The provisioning front-ends attach HERE: portal_sync() (called by net_ensure
+        // right after this tick) raises the SoftAP + captive portal for as long as this
+        // state holds, and the serial console is always live. Both write through
+        // net_creds_save() / claim_start(). Say so on a slow beat regardless: a build
+        // with the portal compiled out, or a unit whose owner never joins the AP,
+        // should not look silently wedged on the monitor.
         static uint32_t last_nag = 0;
         if (!last_nag || millis() - last_nag > 30000) {
             last_nag = millis();
@@ -2336,6 +2985,7 @@ static void net_ensure() {
 static void net_creds_changed() {
     s_wifi_idx      = 0;
     s_wifi_last_try = 0;
+    s_wifi_fails    = 0;   // a fresh credential starts the rescue count over
     if (s_net_state == NET_ST_UP) return;
     if (net_cred_count() > 0 && s_net_state == NET_ST_PROVISION) {
         s_net_state = NET_ST_WAIT_WIFI;
@@ -2360,6 +3010,9 @@ static void net_creds_changed() {
 //   wifi psk <rest of line>   stage a passphrase
 //   wifi save                 commit the staged pair to NVS
 //   wifi clear                forget the provisioned network
+//   claim show                identity pubkey + device id + claim state (never the token)
+//   claim clear               drop the claim block, revert to the baked fallback
+//   claim <code>              claim this unit with a printed setup code
 //
 // SSID and PSK take the REST OF THE LINE verbatim, spaces included: both legitimately
 // contain spaces, and a one-shot "wifi set <ssid> <psk>" form cannot express that
@@ -2384,6 +3037,9 @@ static void serial_exec(char* line) {
 #ifdef GW_NET_HAS_WIFI
                        " | wifi show | wifi ssid <v> | wifi psk <v> | wifi save | wifi clear"
 #endif
+#ifndef GW_NO_CLAIM
+                       " | claim show | claim clear | claim <code>"
+#endif
                        );
         Serial.println("[gw] nothing is echoed; use `pio device monitor --echo` to see typing");
         return;
@@ -2397,8 +3053,48 @@ static void serial_exec(char* line) {
         Serial.printf("[gw] state=%s up=%d iface=%s ip=%s rssi=%d\n",
                       st, (int)net_up(), net_desc().c_str(),
                       net_ip().toString().c_str(), net_rssi());
+#ifdef GW_HAS_PORTAL
+        if (s_portal_up)
+            Serial.printf("[gw] provisioning portal UP: \"%s\" at %s\n",
+                          s_portal_ssid, WiFi.softAPIP().toString().c_str());
+        else
+            Serial.printf("[gw] provisioning portal down (%u failed association(s), "
+                          "credential %s)\n", (unsigned)s_wifi_fails,
+                          !s_nvs_ssid[0] ? "none" : s_nvs_cred_ok ? "proven" : "unproven");
+#endif
         return;
     }
+
+#ifndef GW_NO_CLAIM
+    // The claim half of the console. "claim show" is what kitting and the
+    // family-gateway migration read; it never prints the token, same rule as the PSK.
+    // "claim clear" reverts to the baked fallback — the bench escape hatch that does
+    // not need an NVS erase (which would also re-mint the identity).
+    if (!strcmp(line, "claim show")) {
+        Serial.printf("[gw] device id:  %s\n", s_device_id);
+        Serial.printf("[gw] public key: %s\n", s_pubkey_hex);
+        if (s_claim_site[0]) {
+            Serial.printf("[gw] claimed: site \"%s\"  url %s\n", s_claim_site, s_claim_url);
+            Serial.printf("[gw] token: %s  token id: %s\n",
+                          s_claim_tok[0] ? "(set)" : "(none)",
+                          s_claim_tid[0] ? s_claim_tid : "(none)");
+        } else {
+            Serial.printf("[gw] unclaimed — baked fallback (site \"%s\", token %s)\n",
+                          gw_site(), gw_token()[0] ? "baked" : "NONE — uploads gated off");
+        }
+        claim_console_status();
+        return;
+    }
+    if (!strcmp(line, "claim clear")) {
+        claim_forget();
+        Serial.println("[gw] claim block cleared — baked fallback until re-claimed");
+        return;
+    }
+    if (!strncmp(line, "claim ", 6)) {
+        claim_start(line + 6);   // prints its own accept/reject lines
+        return;
+    }
+#endif
 
 #ifdef GW_NET_HAS_WIFI
     // Staged until "wifi save" — see the rest-of-line note above.
@@ -2502,6 +3198,39 @@ static long long json_ll(const char* json, const char* key) {
     return atoll(p);
 }
 
+#ifndef GW_NO_CLAIM
+#include "claim_client.inc"
+#endif
+
+#include "portal.inc"
+
+#if defined(GW_HAS_PORTAL) || !defined(GW_NO_CLAIM)
+// /setup wears two hats. Over the SoftAP it is the full portal form (WiFi + claim code).
+// On the uplink IP it is the claim-code-only form, live while the unit is not claimed,
+// 404 forever after — never the WiFi fields, which would be an unauthenticated re-point
+// endpoint on a customer's LAN (the surface the portal design refused to create).
+static void setup_route_get() {
+#ifdef GW_HAS_PORTAL
+    if (s_portal_up) { portal_page(); return; }
+#endif
+#ifndef GW_NO_CLAIM
+    claim_setup_page();
+#else
+    s_web.send(404, "text/plain", "not found\n");
+#endif
+}
+static void setup_route_post() {
+#ifdef GW_HAS_PORTAL
+    if (s_portal_up) { portal_submit(); return; }
+#endif
+#ifndef GW_NO_CLAIM
+    claim_setup_submit();
+#else
+    s_web.send(404, "text/plain", "not found\n");
+#endif
+}
+#endif
+
 // Multipart POST per the ingest contract (mirrors host-bridge _post_photo), streamed
 // from three segments (head / body / tail). The body segment is either a RAM buffer
 // (thumbs) or an open LittleFS File (spooled fulls) — either way a 135 KB full never
@@ -2535,19 +3264,19 @@ static bool upload_pending() {
 #endif   // GW_SD_QUEUE
 
 // --- site name (address) fetch ----------------------------------------------------------
-// GET /api/v1/site?slug=<GW_SITE> with the device token; cache the display name in NVS.
+// GET /api/v1/site?slug=<site> with the device token; cache the display name in NVS.
 // Blocking TLS GET, so callers gate it on !radio_busy() like the other HTTP work.
 static void fetch_site_name() {
-    if (!net_up()) return;
+    if (!net_up() || !gw_provisioned()) return;
     WiFiClientSecure tls;
     tls.setInsecure();
     HTTPClient http;
     http.setConnectTimeout(8000);
     http.setTimeout(10000);
-    String url = String(GW_INGEST_URL);
-    url.replace("/ingest", "/site?slug=" GW_SITE);
+    String url = String(gw_url());
+    url.replace("/ingest", String("/site?slug=") + gw_site());
     if (!http.begin(tls, url)) return;
-    http.addHeader("Authorization", "Bearer " GW_INGEST_TOKEN);
+    http.addHeader("Authorization", String("Bearer ") + gw_token());
     if (http.GET() == 200) {
         String body = http.getString();
         char name[sizeof(s_site_name)];
@@ -2625,8 +3354,19 @@ static void oled_render() {
         } else {
 #ifdef GW_NET_HAS_WIFI
             if (s_net_state == NET_ST_PROVISION) {
-                u8g2.drawStr(0, 28, "Needs setup:");
-                u8g2.drawStr(0, 42, "no network yet");
+#ifdef GW_HAS_PORTAL
+                // The screen is the ONLY place an unprovisioned box can tell someone
+                // what to do next, so it names the network to join.
+                if (s_portal_up) {
+                    u8g2.drawStr(0, 28, "Setup - join wifi:");
+                    snprintf(line, sizeof(line), "%.21s", s_portal_ssid);
+                    u8g2.drawStr(0, 42, line);
+                } else
+#endif
+                {
+                    u8g2.drawStr(0, 28, "Needs setup:");
+                    u8g2.drawStr(0, 42, "no network yet");
+                }
             } else if (net_cred_at(s_wifi_idx).ssid) {
                 u8g2.drawStr(0, 28, "trying network:");
                 snprintf(line, sizeof(line), "%.21s", net_cred_at(s_wifi_idx).ssid);
@@ -2777,8 +3517,12 @@ static void emit_self_beat() {
                "\"uploads\":%lu,\"res_ok\":%lu,\"res_fail\":%lu,"
                "\"announces\":%lu,\"announces_rf\":%lu,\"announces_relayed\":%lu,"
                "\"announces_foreign\":%lu,\"leaf_pin\":%s%s%s,\"roster\":%s,"
+               // TOFU auto re-arm: a pin dropped without a human asking is a
+               // security-relevant event, so the count is queryable remotely, not only
+               // visible on the local page.
+               "\"tofu_rearms\":%u,"
                "\"chunks\":%lu%s}}",
-               GW_SITE, GW_SITE, (unsigned long)(millis() / 1000),
+               gw_site(), gw_site(), (unsigned long)(millis() / 1000),
                net_rssi(), reset_reason_str(),
                (unsigned)ESP.getFreeHeap(), net_desc().c_str(),
                net_ip().toString().c_str(),
@@ -2795,8 +3539,139 @@ static void emit_self_beat() {
                (unsigned long)s_stats.announces_foreign,
                s_roster_n ? "\"" : "", s_roster_n ? s_roster[0].hex : "null",
                s_roster_n ? "\"" : "", roster,
+               (unsigned)s_rearms_done,
                (unsigned long)s_stats.chunks, sdq);
 }
+
+// --- factory reset: 5 s BOOT hold --------------------------------------------------------
+// Design of record: homelab docs/trailcam/gateway-provisioning.md §4, "Factory reset".
+// Only the production gateway PCB (v0.2) has this button + LED wired: BOOT is IO0/SW2,
+// STATUS is IO4 (GPIO map v0.2, docs/trailcam/gateway-pcb.md). GW_NET_ETH_W5500 is set
+// ONLY by [s3_gateway_common] in platformio.ini — the W5500 chip only exists on that
+// board — so this whole feature compiles out on the Heltec V3 and T-Internet-POE
+// envs, which have no STATUS LED at this pin to drive.
+#ifdef GW_NET_ETH_W5500
+#define GW_FACTORY_RESET_PIN     0      // IO0, SW2 — BOOT button, active LOW (board pull-up)
+#define GW_FACTORY_RESET_LED     4      // IO4 — STATUS LED, active HIGH
+#define GW_FACTORY_RESET_HOLD_MS 5000u
+
+static uint32_t s_reset_hold_start = 0;   // 0 = button not currently held
+static bool     s_reset_fired      = false;   // latches once per hold; a bounce can't refire mid-blink
+
+// Blocking on purpose: this runs once, right before ESP.restart(), so borrowing the loop
+// for ~1 s here costs nothing a reboot doesn't already cost. Six fast blinks is a pattern
+// nothing else on this pin will ever show, since nothing else drives IO4 yet.
+static void factory_reset_led_confirm() {
+    for (int i = 0; i < 6; i++) {
+        digitalWrite(GW_FACTORY_RESET_LED, HIGH);
+        delay(80);
+        digitalWrite(GW_FACTORY_RESET_LED, LOW);
+        delay(80);
+    }
+}
+
+// THE INVARIANT (stated twice in the design doc, and here a third time): this clears
+// wifi_* and claim_* and NOTHING else. gateway/rns_prv is NEVER touched here — it is
+// this device's serial number to the whole mesh (node-identity.md) and the second claim
+// factor, and a reset that re-mints it turns a supported recovery into an ops ticket.
+// net_creds_clear() and claim_forget() are both guarded to their own keys under the
+// "gateway" NVS namespace already; do not replace either with an erase_flash-style wipe
+// to "really" reset the box — that IS the identity-mint path, and it is out of scope by
+// design (gateway-provisioning.md §4: equivalent to replacing the board).
+static void factory_reset_fire() {
+    Serial.println("[gw] factory reset: BOOT held 5s -> clearing WiFi + claim (identity kept)");
+    net_creds_clear();       // wifi_ssid / wifi_psk / wifi_ok only — never rns_prv
+#ifndef GW_NO_CLAIM
+    claim_forget();          // claim_code / claim_site / claim_url / claim_tok / claim_tid only — never rns_prv
+#endif
+    factory_reset_led_confirm();
+    Serial.println("[gw] factory reset done -> rebooting into UNCLAIMED + PROVISION");
+    delay(150);
+    ESP.restart();
+}
+
+// Non-blocking hold detection, polled from loop() like every other tick here. Fires once
+// per hold (s_reset_fired latches until release), so there is no double-fire and no
+// dependence on how long the button stays down after the 5 s mark.
+static void factory_reset_tick() {
+    if (digitalRead(GW_FACTORY_RESET_PIN) != LOW) {   // released (or never pressed): rearm
+        s_reset_hold_start = 0;
+        s_reset_fired = false;
+        return;
+    }
+    if (!s_reset_hold_start) { s_reset_hold_start = millis(); return; }
+    if (s_reset_fired) return;
+    if (millis() - s_reset_hold_start < GW_FACTORY_RESET_HOLD_MS) return;
+    s_reset_fired = true;
+    factory_reset_fire();
+}
+#endif   // GW_NET_ETH_W5500
+
+// --- OTA rollback -------------------------------------------------------------------------
+// Two app slots are only a RE-FLASH path unless something can decide the new image is
+// bad and go back on its own. On a tower node the difference is a climb.
+//
+// The core-3.x bootloader already has CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y (and the
+// app side CONFIG_APP_ROLLBACK_ENABLE=y, which is what gates the hook below), so an
+// espota image boots in ESP_OTA_IMG_PENDING_VERIFY. What arduino-esp32 then does by
+// default is mark it valid inside initArduino(), BEFORE setup() runs — which only ever
+// catches an image that cannot reach initArduino() at all. An image that boots fine and
+// then cannot get on the network is exactly the one that strands the box, and the default
+// blesses it.
+//
+// verifyRollbackLater() is the core's weak hook for saying "not yet". Overriding it to
+// true defers the verdict to us, and we cast it in loop() the moment the uplink is up and
+// ArduinoOTA is listening — i.e. once the box has proven it is re-flashable. An image that
+// never gets there is rolled back to the previous slot on the next reboot.
+//
+// OPT-IN, and only the production gateway PCB opts in ([s3_gateway_common] sets
+// GW_OTA_ROLLBACK). The Heltec and T-Internet-POE gateways keep the mark-at-boot
+// behaviour they were flashed with; changing the recovery semantics of a board already
+// up a tree is not this bead's business.
+#ifdef GW_OTA_ROLLBACK
+#include "esp_ota_ops.h"
+
+// Weak symbol in esp32-hal-misc.c. Returning true means "I will call
+// esp_ota_mark_app_valid_cancel_rollback() myself"; the core then leaves the partition
+// PENDING_VERIFY through setup().
+//
+// extern "C" IS LOAD-BEARING. esp32-hal-misc.c is C, so the weak symbol is the unmangled
+// `verifyRollbackLater`. Defining it as plain C++ here emits _Z20verifyRollbackLaterv,
+// which overrides nothing: the build succeeds, the core keeps its own default, and the
+// image goes on being marked valid at boot. The failure is silent, which is the worst
+// kind for a recovery path, so verify with:
+//   xtensa-esp32s3-elf-nm .pio/build/s3-gateway/firmware.elf | grep verifyRollbackLater
+// and expect ONE unmangled T symbol.
+extern "C" bool verifyRollbackLater() { return true; }
+
+static bool s_ota_marked_valid = false;   // settled: nothing left to do this boot
+static bool s_ota_mark_warned  = false;   // the failure has been said once
+
+// Called on every network-up edge until it settles. The latch is set only when the
+// verdict is actually in — either the partition was never pending (a normal boot, where
+// esp_ota_get_state_partition reports ESP_OTA_IMG_VALID and there is nothing to cancel),
+// or the mark succeeded. A failed mark deliberately does NOT latch, so the next link-up
+// tries again; the alarm is rate-limited to once per boot instead.
+static void ota_mark_valid_once() {
+    if (s_ota_marked_valid) return;
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state = ESP_OTA_IMG_VALID;
+    if (!running || esp_ota_get_state_partition(running, &state) != ESP_OK) return;
+    if (state != ESP_OTA_IMG_PENDING_VERIFY) { s_ota_marked_valid = true; return; }
+    if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+        s_ota_marked_valid = true;
+        Serial.println("[gw] OTA image CONFIRMED (network + OTA up) — rollback cancelled");
+        log_event("OTA image confirmed good — rollback cancelled");
+        return;
+    }
+    if (!s_ota_mark_warned) {
+        s_ota_mark_warned = true;
+        Serial.println("[gw] *** OTA image could NOT be marked valid — this build rolls "
+                       "back to the previous slot on the next reboot ***");
+        log_event("OTA mark-valid FAILED — will roll back on reboot");
+    }
+}
+#endif   // GW_OTA_ROLLBACK
 
 // --- bring-up ---------------------------------------------------------------------------
 void setup() {
@@ -2804,6 +3679,14 @@ void setup() {
     uint32_t t0 = millis();
     while (!Serial && millis() - t0 < 3000) delay(100);
     Serial.printf("[gw] firmware %s booting\n", GW_FW_VERSION);
+#ifdef GW_NET_ETH_W5500
+    pinMode(GW_FACTORY_RESET_PIN, INPUT_PULLUP);   // BOOT/SW2 — board already pulls up; belt+braces
+    pinMode(GW_FACTORY_RESET_LED, OUTPUT);
+    digitalWrite(GW_FACTORY_RESET_LED, LOW);       // STATUS LED off until a reset fires
+#endif
+#ifndef GW_NO_CLAIM
+    claim_load();
+#endif
     load_cached_site_name();          // so the screen shows the address at once
     // Bug 7: restore the leaf identity roster. Empty -> TOFU arms; direct announces
     // with a health tail (real leaves, never the surveyor) enroll themselves.
@@ -2921,6 +3804,15 @@ void setup() {
     reticulum.start();
 
     RNS::Identity id = load_or_create_identity();
+    snprintf(s_pubkey_hex, sizeof(s_pubkey_hex), "%s", id.get_public_key().toHex().c_str());
+    snprintf(s_device_id, sizeof(s_device_id), "gw-%.8s", id.hexhash().c_str());
+    snprintf(s_identity_hash, sizeof(s_identity_hash), "%s", id.hexhash().c_str());
+    Serial.printf("[gw] identity public key: %s\n", s_pubkey_hex);
+    Serial.printf("[gw] device id: %s\n", s_device_id);
+#ifndef GW_NO_CLAIM
+    s_identity = id;        // the claim request is signed with this key
+    claim_init_state();     // resume CLAIMED / an interrupted claim from NVS
+#endif
     gw_destination = RNS::Destination(id, RNS::Type::Destination::IN,
                                       RNS::Type::Destination::SINGLE, APP_NAME, ASPECT);
     gw_destination.accepts_links(true);
@@ -3067,8 +3959,21 @@ void setup() {
         }
         s_web.send(200, "text/plain", out);
     });
-    // s_web.begin() happens on first network-up in loop(): binding before the
-    // interface exists leaves the listener dead (connection refused).
+#if defined(GW_HAS_PORTAL) || !defined(GW_NO_CLAIM)
+    // Setup surfaces (step 8): the SoftAP portal form and/or the LAN
+    // claim form, dispatched by setup_route_*. Registered always; the handlers decide
+    // per-request which hat /setup wears, and 404 when neither applies.
+    s_web.on("/setup", HTTP_GET,  setup_route_get);
+    s_web.on("/setup", HTTP_POST, setup_route_post);
+#endif
+#ifdef GW_HAS_PORTAL
+    // onNotFound is what turns a phone's captive-portal probe into the setup form; when
+    // the AP is down it degrades to a plain 404.
+    s_web.onNotFound(portal_not_found);
+#endif
+    // s_web.begin() happens on the first network-up in loop(), or earlier, when the
+    // provisioning portal raises its AP. Binding before any interface exists leaves the
+    // listener dead (connection refused), so it is never done here.
 
     net_setup();
 }
@@ -3090,8 +3995,12 @@ void loop() {
             // fall through into the normal loop body this tick
         } else {
             s_web.handleClient();
+            portal_loop();
             ArduinoOTA.handle();
             serial_console_loop();   // stays live during an rf/test window on purpose
+#ifdef GW_NET_ETH_W5500
+            factory_reset_tick();    // BOOT hold must work during an rf/test window too
+#endif
             net_ensure();
             return;
         }
@@ -3112,9 +4021,80 @@ void loop() {
         s_have_reply_out[0] = 0;
     }
 
+    // A roster leaf just announced -> it's awake and listening; fire ITS pending
+    // commands NOW, plus a time_sync when due (cold-boot hello, or the periodic
+    // drift refresh). Per entry: each leaf wakes on its own schedule.
+    //
+    // ⚠️ POSITION IS THE FIX (2026-09-03). This ran at the BOTTOM of loop(),
+    // behind gw_destination.announce(), poll_commands() and fetch_site_name() — two
+    // blocking TLS GETs. Sniffing both sides off one RAK breakout on the shared ladder
+    // measured the gateway's reply at a **median 7.0 s** after the leaf finished
+    // announcing (mean 8.2, max 20), while the leaf's window is
+    // leaf_radio_poll_commands(2500) — **75 % of replies landed after it had shut**, so
+    // no command ever arrived. Same failure the "have?" reply hit on 2026-07-18 and for
+    // the same reason: HTTP work sat between dispatch and the send. Radio replies
+    // outrank telemetry — keep this above the WiFi/HTTP section.
+    for (int i = 0; i < s_roster_n; i++) {
+        LeafEntry& L = s_roster[i];
+        if (!L.announced) continue;
+        L.announced = false;
+        const bool direct = L.announce_direct;
+        // Heard direct while WE sit on base = this member is reachable on
+        // base — the walk-back shepherd's per-leaf exit evidence. Direct only (a
+        // relay can hear a rung we can't, bug 1); read s_rf.current before anything
+        // below retunes it.
+        if (direct && s_rf.current == LORA_PROFILE_BASE) {
+            L.base_heard_ms = millis();
+            if (L.shep_wait) {
+                L.shep_wait = false;
+                Serial.printf("[gw] ADR: shepherd — %s heard on base, debt cleared\n",
+                              L.slug[0] ? L.slug : L.hex);
+                log_event("ADR shepherd: %s on base", L.slug[0] ? L.slug : "leaf");
+            }
+        }
+        rf_on_leaf_announce(direct);                 // confirm/adopt profile state first
+        // Commands still deliver on relayed announces (RNS routes them through the
+        // relay — legitimate in a relay topology); only ADR is direct-only.
+        const int cmds_sent = deliver_pending_commands(L);
+        // ADR GOES BEFORE THE TIME SYNC, AND SUPPRESSES IT (2026-09-07).
+        //
+        // A grant gets exactly ONE transmission. We retune to the granted profile the
+        // instant we send it, which makes us deaf to a leaf still sitting on the old
+        // one — so a grant that misses the leaf's RX window can never be retried, it
+        // can only time out and revert. That window is leaf_radio_poll_commands(2500):
+        // 2.5 s, opening the moment the leaf's own announce clears the air.
+        //
+        // Sent last, the grant was losing that window to the time sync. Measured on the
+        // bench against board 0016 (leaf-0.23.0, two feet away, rssi -4): across eleven
+        // consecutive downlink windows the leaf received exactly one frame, a time_sync,
+        // and never once saw a grant — every attempt ended "ADR revert (no confirm)"
+        // ~20 s later. A freshly pinned leaf has synced_once=false, so maybe_time_sync()
+        // fires on the very same announce that first makes the site single-leaf and
+        // therefore grantable: the sync takes the slot, its RNS ack puts the leaf's
+        // half-duplex radio into TX (deaf), and the grant lands in the gap or after the
+        // window has shut. That is every TOFU re-arm, every gateway reboot, every newly
+        // enrolled node — i.e. exactly when a site is trying to settle on a rung.
+        //
+        // Skipping the sync costs nothing: it is periodic, the leaf re-requests nothing,
+        // and rf_on_leaf_announce() calls arm_urgent_sync_all() the moment a grant is
+        // CONFIRMED — so a successful grant re-arms the very sync this suppressed, one
+        // announce later and now on the correct profile.
+        const bool adr_sent = direct && maybe_grant_profile(L, cmds_sent);
+        if (!adr_sent) maybe_time_sync(L);
+    }
+
+    // Garbage-collect a pin whose leaf is provably gone. Deliberately AFTER the
+    // delivery loop and outside packet dispatch: it rewrites the roster array the loop
+    // above is iterating, and it defers its NVS write like enrollment does.
+    tofu_rearm_scan();
+
     s_web.handleClient();
+    portal_loop();
     ArduinoOTA.handle();
     serial_console_loop();
+#ifdef GW_NET_ETH_W5500
+    factory_reset_tick();
+#endif
 
     net_ensure();
     ntp_ensure();
@@ -3145,10 +4125,14 @@ void loop() {
         if (net_was_up) {
             Serial.printf("[gw] network up (%s), ip=%s rssi=%d\n",
                           net_desc().c_str(), net_ip().toString().c_str(), net_rssi());
-            static bool web_started = false;
-            if (!web_started) { s_web.begin(); web_started = true; }
+            web_begin_once();
             static bool ota_started = false;
             if (!ota_started) { ota_setup(); ota_started = true; }
+#ifdef GW_OTA_ROLLBACK
+            // The bar for "this image is good": an uplink AND a listening espota server.
+            // Anything short of that is a box that would need a climb, so it rolls back.
+            ota_mark_valid_once();
+#endif
 #ifdef GW_NET_HAS_ETH
             // WIRED ONLY, deliberately (an open sub-question, resolved this way for
             // now): the RNS-over-UDP bridge is a wired-tower role — it exposes the mesh to
@@ -3205,6 +4189,12 @@ void loop() {
         fetch_site_name();
     }
 
+#ifndef GW_NO_CLAIM
+    // Claim state machine: a blocking TLS POST when one is due, so it rides
+    // the same radio-quiet gate as the rest of the HTTP work.
+    if (!radio_busy() && net_up()) claim_tick();
+#endif
+
     // TOFU enrollment landed inside announce dispatch -> persist it here (no NVS
     // writes from inside packet handling).
     if (s_pin_save_pending) {
@@ -3212,23 +4202,6 @@ void loop() {
         save_roster();
     }
 
-    // A roster leaf just announced -> it's awake and listening; fire ITS pending
-    // commands NOW, plus a time_sync when due (cold-boot hello, or the periodic
-    // drift refresh). Per entry: each leaf wakes on its own schedule.
-    for (int i = 0; i < s_roster_n; i++) {
-        LeafEntry& L = s_roster[i];
-        if (!L.announced) continue;
-        L.announced = false;
-        const bool direct = L.announce_direct;
-        rf_on_leaf_announce(direct);                 // confirm/adopt profile state first
-        // Commands + time sync still deliver on relayed announces (RNS routes them
-        // through the relay — legitimate in a relay topology); only ADR is direct-only.
-        const int cmds_sent = deliver_pending_commands(L);
-        maybe_time_sync(L);
-        // Grant last: it retunes the radio. Direct announces only (bug 1) — a grant
-        // decision keyed off a relayed announce acts on a link we can't even hear.
-        if (direct) maybe_grant_profile(L, cmds_sent);
-    }
 
     // A FOREIGN trailcam.leaf announced (bug 7): it gets its probe_ack — probes are
     // the surveyor's whole job, and the walker's post-announce RX window is the same
@@ -3285,9 +4258,9 @@ void loop() {
         sdq_loop();        // re-mount attempts (card inserted with no reboot) + stats
         // One frame per pass: coming back through loop() between POSTs keeps the radio
         // and the web server serviced while a long backlog drains.
-        if (s_sdq.mounted && s_sdq.depth && net_up()) sdq_drain_one();
+        if (s_sdq.mounted && s_sdq.depth && net_up() && gw_provisioned()) sdq_drain_one();
 #endif
-        if ((s_pending.jpeg || s_pending.spooled) && net_up()) {
+        if ((s_pending.jpeg || s_pending.spooled) && net_up() && gw_provisioned()) {
             if (upload_pending()) pending_clear();
         }
     }

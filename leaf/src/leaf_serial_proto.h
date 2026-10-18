@@ -34,7 +34,7 @@ struct LeafTelemetry {
 // Firmware version string, reported in telemetry and (with LEAF_BLE) in the BLE status
 // characteristic. Here rather than in the .cpp so both report the same value.
 #ifndef LEAF_FW_VERSION
-#define LEAF_FW_VERSION "leaf-0.18.1"
+#define LEAF_FW_VERSION "leaf-0.24.0"
 #endif
 
 // Wire identity: "leaf-" + the first 8 hex of the RNS destination hash, pushed in by the

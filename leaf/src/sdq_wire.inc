@@ -62,6 +62,34 @@ static long long json_ll(const char* json, const char* key) {
 static struct { uint32_t uploads_ok = 0; } s_stats;   // upload_body bumps this
 static const char* gw_fallback_camera() { return "leaf-wire-fallback"; }
 
+// --- who this harness uploads as ------------------------------------------------------
+// sd_queue_upload.inc asks its host for gw_site()/gw_url()/gw_token() and, unless
+// GW_NO_CLAIM is defined, for claim_note_ingest_401()/claim_note_ingest_ok(). Those five
+// arrived on the gateway with the claim flow (gateway-0.16.0) and live in
+// gateway/src/main.cpp, which this harness does not compile — so from that commit until
+// this one, leaf-pcb-sdq-wire did not build at all.
+//
+// GW_NO_CLAIM is the gateway's own name for "a build that must not carry the claim path",
+// and that is exactly this build: there is no NVS claim block on a leaf and no claim
+// client here to write one. Defining it compiles the accessors down to the baked macros,
+// which is where this harness's credentials have always come from — GW_SITE from the env's
+// build_flags, GW_INGEST_URL and GW_INGEST_TOKEN from the gitignored wire_secrets.h — and
+// it drops the two claim_note_ingest_* calls with them.
+//
+// WHAT THAT COSTS THE TEST: nothing this harness exists to check. The bytes on the wire,
+// Content-Length, the boundary, the five form fields, the file payload and the
+// code->outcome mapping are all still the shipping code, posted at the probe server. The
+// one gateway behaviour NOT exercised here is the 401 strike counter that triggers an
+// unattended re-claim; that path is gateway-only and needs the claim client, so testing it
+// belongs on a gateway, not on this board.
+#define GW_NO_CLAIM 1
+#if !defined(GW_INGEST_URL) || !defined(GW_INGEST_TOKEN)
+#error "GW_INGEST_URL / GW_INGEST_TOKEN must come from leaf/src/wire_secrets.h — regenerate it from the gateway's secrets.ini"
+#endif
+static inline const char* gw_site()  { return GW_SITE; }
+static inline const char* gw_token() { return GW_INGEST_TOKEN; }
+static inline const char* gw_url()   { return GW_INGEST_URL; }
+
 #define SDQ_FS SD
 #define SDQ_FS_MOUNT() SD.begin(LEAF_SD_SPI_CS, SPI)
 #define SDQ_NO_PROBE 1

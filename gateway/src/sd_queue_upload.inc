@@ -10,7 +10,8 @@
 // Include AFTER the host has provided:
 //   log_event(fmt, ...)          — event ring
 //   s_stats.uploads_ok           — counter
-// and with GW_SITE / GW_INGEST_URL / GW_INGEST_TOKEN defined.
+// and with the gw_site()/gw_url()/gw_token() accessors in scope (NVS claim
+// block first, baked macro fallback).
 class ConcatStream : public Stream {
 public:
     ConcatStream(const String& head, const uint8_t* body, size_t blen, const String& tail)
@@ -122,7 +123,7 @@ static UploadOutcome upload_body(const char* eid, const char* cam, const char* k
         head += "Content-Disposition: form-data; name=\""; head += name; head += "\"\r\n\r\n";
         head += val; head += "\r\n";
     };
-    field("site", GW_SITE);
+    field("site", gw_site());
     field("camera", cam);
     field("event_id", eid);
     field("captured_at", String(capts));
@@ -138,8 +139,8 @@ static UploadOutcome upload_body(const char* eid, const char* cam, const char* k
     http.setConnectTimeout(10000);
     http.setTimeout(30000);
     UploadOutcome out = UP_RETRY;
-    if (http.begin(tls, GW_INGEST_URL)) {
-        http.addHeader("Authorization", "Bearer " GW_INGEST_TOKEN);
+    if (http.begin(tls, String(gw_url()))) {
+        http.addHeader("Authorization", String("Bearer ") + gw_token());
         http.addHeader("Content-Type", String("multipart/form-data; boundary=") + B);
         ConcatStream mem(head, buf, len, tail);
         ConcatStream fil(head, f,   len, tail);
@@ -147,6 +148,12 @@ static UploadOutcome upload_body(const char* eid, const char* cam, const char* k
         size_t total = head.length() + len + tail.length();
         int code = http.sendRequest("POST", body, total);
         const bool ok = code >= 200 && code < 300;
+#ifndef GW_NO_CLAIM
+        // A revoked device token surfaces here as 401s; two of them >10 min apart
+        // trigger an unattended re-claim (claim_client.inc). 2xx clears the strike.
+        if (code == 401) claim_note_ingest_401();
+        else if (ok)     claim_note_ingest_ok();
+#endif
         out = ok ? UP_OK : UP_RETRY;
         Serial.printf("[gw] upload %s %s (%u bytes) -> HTTP %d%s\n",
                       eid, kind, (unsigned)len, code, ok ? "" : " (will retry)");

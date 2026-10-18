@@ -43,11 +43,23 @@ static inline void leaf_cam_rail_hold() {
     leaf_cam_rail_hold_flag() = true;
     leaf_cam_rail_force(true);
 }
+#ifdef LORA_BACKEND_RAK3172
+// Defined in lib/lora_interface/Rak3172Modem.cpp. On a v1.0 board the radio is an AT
+// modem on IO14/IO2 with NRST on IO1 and BOOT0 on IO42, and a push-pull ESP32 output
+// into an UNPOWERED module back-feeds it through its protection diodes. So every path
+// that drops LORA_3V3 must first float the UART pair and pull NRST low — respin spec §11.
+// It hangs off leaf_radio_rail() rather than the sleep paths so that no future caller can
+// cut the rail without it, and it is safe on a wake that never brought the radio up.
+void leaf_rak_pins_quiesce();
+#endif
 static inline void leaf_radio_rail(bool on) {
 #ifdef LEAF_RADIO_PWR_GPIO
+#ifdef LORA_BACKEND_RAK3172
+    if (!on) leaf_rak_pins_quiesce();
+#endif
     pinMode(LEAF_RADIO_PWR_GPIO, OUTPUT);
     digitalWrite(LEAF_RADIO_PWR_GPIO, on ? LOW : HIGH);
-    if (on) delay(2);   // rail + SX1262/SD bulk caps settle
+    if (on) delay(2);   // rail + radio/SD bulk caps settle
 #else
     (void)on;
 #endif

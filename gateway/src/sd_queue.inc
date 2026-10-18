@@ -24,6 +24,21 @@
 #ifndef SDQ_FS_MOUNT
 #define SDQ_FS_MOUNT() SDQ_FS.begin("/sdcard", /*mode1bit=*/true, /*format_if_empty=*/false)
 #endif
+
+// SLOT PINS. SD_MMC defaults to the ESP32 classic's fixed-function slot-1 pins (CLK 14 /
+// CMD 15 / D0 2), which is why the T-Internet-POE needs no setPins call at all. On the
+// ESP32-S3 the SDMMC host is routed through the GPIO matrix, so those defaults are simply
+// the wrong pins and begin() never sees a card. The production gateway PCB puts the slot
+// on CLK 15 / CMD 16 / D0 17 (homelab docs/trailcam/gateway-pcb.md, GPIO map v0.2);
+// [s3_gateway_common] passes them as GW_SD_CLK/CMD/D0 and this calls setPins() before
+// every mount attempt. A board that passes nothing keeps the old defaults byte for byte.
+#ifndef SDQ_FS_SETPINS
+#if defined(GW_SD_CLK) && defined(GW_SD_CMD) && defined(GW_SD_D0)
+#define SDQ_FS_SETPINS() SDQ_FS.setPins(GW_SD_CLK, GW_SD_CMD, GW_SD_D0)
+#else
+#define SDQ_FS_SETPINS() ((void)0)
+#endif
+#endif
 #include <ctype.h>
 
 #define GW_SDQ_DIR       "/q"
@@ -333,12 +348,14 @@ static bool sdq_mount_blocking() {
     s_sdq.mount_ms = millis() | 1u;
     s_sdq.mounted  = false;
     SDQ_FS.end();
-    // 1-bit mode: only CLK 14 / CMD 15 / D0 2 are used, which is what keeps the SD set
-    // clear of the RMII PHY and the Core1262's SPI. Never format — a card with photos on
-    // it from a previous box is data, not scratch space.
-    // PORTING NOTE: those pins are fixed-function on the ESP32 classic. On the S3 gateway
-    // PCB they are GPIO-matrix routed, so that port must call
-    // SDQ_FS.setPins(clk, cmd, d0) BEFORE begin() (pins reserved in the board doc).
+    // 1-bit mode: only CLK / CMD / D0 are used, which is what keeps the SD set clear of
+    // the RMII PHY and the Core1262's SPI on the classic board, and clear of the W5500's
+    // SPI3 on the S3 one. Never format — a card with photos on it from a previous box is
+    // data, not scratch space.
+    // The pins are the ESP32 classic's fixed-function 14/15/2 unless the build passes its
+    // own; the S3 routes SDMMC through the GPIO matrix, so setPins() has to run BEFORE
+    // begin() there or the host drives the wrong pads and no card is ever found.
+    SDQ_FS_SETPINS();
     if (!SDQ_FS_MOUNT()) {
         s_sdq.mount_fails++;
         if (!s_sdq.announced) {
@@ -406,13 +423,21 @@ static bool sdq_mount_blocking() {
 // that is a climb. So: run it in its own task, bounded by a timeout, and never block
 // loop() waiting for it.
 #ifndef SDQ_NO_PROBE
-// The probe runs PINNED TO CPU 0 and the idle task of that core is temporarily
-// unsubscribed from the task watchdog while it is in flight. Both are required, and
-// both were learned the hard way (bench, 2026-08-09): on an empty slot SDQ_FS.begin()
-// does not merely block, it BUSY-SPINS without yielding, so IDLE0 never runs and the
-// TWDT panics at ~5 s — a reboot loop — long before any userland timeout could fire.
-// Unsubscribing IDLE0 lets our own timeout win; pinning keeps the spin off CPU 1 where
+// The probe runs PINNED TO CPU 0 at IDLE PRIORITY. Both are required. Learned on the
+// bench (2026-08-09): on an empty slot SDQ_FS.begin() does not merely block, it
+// BUSY-SPINS without yielding. At any priority above idle that starves IDLE0, and the
+// task watchdog (TWDT) panics at ~5 s, a reboot loop, long before any userland timeout
+// could fire. At idle priority the tick time-slices the spin with IDLE0, so IDLE0 keeps
+// feeding the TWDT and our own timeout wins. Pinning keeps the spin off CPU 1, where
 // loopTask/Arduino lives, so the gateway keeps servicing ethernet, OTA and the radio.
+//
+// WHY NOT UNSUBSCRIBE IDLE0 instead (what this did until 2026-10). In this IDF the TWDT
+// watches IDLE0 as a subscribed task AND registers an idle hook that calls
+// esp_task_wdt_reset() on every idle pass. esp_task_wdt_delete(IDLE0) removes the
+// subscription but not the hook, which nothing outside task_wdt.c can reach. So every
+// idle pass on core 0 logged "esp_task_wdt_reset: task not found" (181/s seen on the
+// v0.4 board) for as long as a probe was in flight, and core 0 had no idle watchdog for
+// that window. Staying subscribed keeps both the log quiet and the watchdog armed.
 #define GW_SDQ_PROBE_TIMEOUT_MS 4000u
 #define GW_SDQ_PROBE_STACK      4096
 
@@ -421,21 +446,6 @@ static volatile bool s_sdq_probe_done    = false;   // ...and it finished its wo
 static bool          s_sdq_probe_stuck   = false;   // a probe never returned: give up
 static uint32_t      s_sdq_probe_start   = 0;
 static TaskHandle_t  s_sdq_probe_handle  = nullptr;
-
-// Idle-task TWDT subscription, toggled around a probe. Guarded so we only ever re-add
-// what we actually removed.
-static bool s_sdq_idle_wdt_off = false;
-
-static void sdq_idle_wdt(bool watched) {
-    TaskHandle_t idle0 = xTaskGetIdleTaskHandleForCPU(0);
-    if (!idle0) return;
-    if (!watched && !s_sdq_idle_wdt_off) {
-        if (esp_task_wdt_delete(idle0) == ESP_OK) s_sdq_idle_wdt_off = true;
-    } else if (watched && s_sdq_idle_wdt_off) {
-        esp_task_wdt_add(idle0);
-        s_sdq_idle_wdt_off = false;
-    }
-}
 
 // Ends SUSPENDED rather than self-deleting, so sdq_loop() is the single owner of the
 // handle and can vTaskDelete() it on either path without racing a self-delete.
@@ -450,12 +460,10 @@ static void sdq_probe_spawn() {
     s_sdq_probe_pending = true;
     s_sdq_probe_start   = millis();
     s_sdq.mount_ms      = millis() | 1u;
-    sdq_idle_wdt(false);
     if (xTaskCreatePinnedToCore(sdq_probe_task, "sdq_probe", GW_SDQ_PROBE_STACK,
-                                nullptr, 1, &s_sdq_probe_handle, 0) != pdPASS) {
+                                nullptr, tskIDLE_PRIORITY, &s_sdq_probe_handle, 0) != pdPASS) {
         s_sdq_probe_pending = false;
         s_sdq_probe_handle  = nullptr;
-        sdq_idle_wdt(true);
         s_sdq.mount_fails++;
         Serial.println("[gw] sd queue: could not spawn mount probe — staying depth 1");
     }
@@ -464,8 +472,68 @@ static void sdq_probe_spawn() {
 static void sdq_probe_reap() {
     if (s_sdq_probe_handle) { vTaskDelete(s_sdq_probe_handle); s_sdq_probe_handle = nullptr; }
     s_sdq_probe_pending = false;
-    sdq_idle_wdt(true);
 }
+
+// --- card detect -------------------------------------------------------------------------
+// The probe machinery below is CONTAINMENT for a driver that cannot tell an empty slot
+// from a wedged one. A real card-detect line removes the need to find out: the production
+// gateway PCB routes the socket's mechanical switch to IO21 with a 10k pull-up (switch to
+// GND), so LOW means a card is seated. GW_SD_CD_PIN carries it in from [s3_gateway_common].
+//
+// WHY NOT slot_config.cd. esp-idf's sdmmc slot config has a cd field for exactly this, but
+// Arduino's SD_MMC wrapper hardcodes SDMMC_SLOT_NO_CD and offers no way to set it, so using
+// it means abandoning SD_MMC and re-implementing the mount, the VFS registration and the
+// FATFS glue on the raw driver. Reading the pin ourselves buys the same property — begin()
+// is never called on an empty slot — for one digitalRead, and keeps the leaf harness
+// (leaf/src/sdq_gates.inc, SPI-mode SD) compiling against the identical file.
+//
+// THE CONTAINMENT STAYS. A CD switch says a card is PRESENT, not that it is sound: a
+// cracked card or an unpulled CMD line still wedges begin(), and that is the case the
+// pinned-to-core-0 / idle-priority / timed-out probe exists for. CD narrows the wedge
+// window, it does not close it.
+//
+// Boards with no CD line define nothing and get the old behaviour exactly: assume a card
+// might be there, probe, contain.
+#ifdef GW_SD_CD_PIN
+static int8_t s_sdq_cd_last = -1;    // -1 = not sampled yet (so boot logs no fake edge)
+
+static bool sdq_card_present() { return digitalRead(GW_SD_CD_PIN) == LOW; }
+
+// Called once per sdq_loop() pass, after the probe-pending return (see there for why).
+// Acts only on an EDGE, so it is a few cycles in the steady state. Insertion clears the
+// give-up latch, which is the capability this line buys: fitting a card in the field
+// stops needing a reboot (and on a tower, a climb).
+static void sdq_cd_track() {
+    if (s_sdq_cd_last < 0) {
+        // First pass of the boot: claim the pin, then take the reference sample. Doing it
+        // here rather than in setup() keeps every CD detail inside this file, which is
+        // what lets the leaf harness go on including it unchanged.
+        pinMode(GW_SD_CD_PIN, INPUT_PULLUP);   // board pulls up too; belt + braces
+        s_sdq_cd_last = sdq_card_present() ? 1 : 0;
+        Serial.printf("[gw] sd queue: card detect (IO%d) reads %s at boot\n",
+                      (int)GW_SD_CD_PIN, s_sdq_cd_last ? "CARD PRESENT" : "SLOT EMPTY");
+        return;
+    }
+    const bool present = sdq_card_present();
+    if ((s_sdq_cd_last == 1) == present) return;
+    s_sdq_cd_last = present ? 1 : 0;
+    if (present) {
+        s_sdq_probe_stuck = false;   // fresh slot state: this card has never been probed
+        s_sdq.announced   = false;
+        s_sdq.mount_ms    = 0;       // probe on the very next pass, not in 60 s
+        Serial.println("[gw] sd queue: card INSERTED (CD) -> probing");
+        return;
+    }
+    if (s_sdq.mounted) SDQ_FS.end();
+    s_sdq.mounted = false;
+    s_sdq.depth = s_sdq.thumbs = s_sdq.fulls = s_sdq.strays = 0;
+    s_sdq.oldest_key = s_sdq.newest_key = 0;
+    s_sdq.announced = true;          // "no card" is already said by this line
+    Serial.println("[gw] *** sd queue: card REMOVED (CD) — upload queue is DEPTH 1 until "
+                   "one is fitted ***");
+    log_event("SD card removed — upload depth 1, outages lose frames");
+}
+#endif   // GW_SD_CD_PIN
 
 // Periodic housekeeping from loop(): re-mount attempts (so installing a card in the
 // field needs no reboot / no tree climb) and a stats refresh for the beat + web ring.
@@ -496,7 +564,20 @@ static void sdq_loop() {
         }
         return;
     }
+#ifdef GW_SD_CD_PIN
+    // Deliberately BELOW the probe-pending return: a removal edge tears the mount down,
+    // and doing that while the probe task is inside SDQ_FS.begin() would be two threads
+    // in the driver at once. A probe resolves within GW_SDQ_PROBE_TIMEOUT_MS, so the edge
+    // is seen a beat later and nothing is missed.
+    sdq_cd_track();
+#endif
     if (!s_sdq.mounted) {
+#ifdef GW_SD_CD_PIN
+        // The whole point of the CD line: an empty slot is KNOWN, so begin() — which
+        // busy-spins forever on one — is never called. sdq_cd_track() re-arms us on the
+        // insertion edge.
+        if (!sdq_card_present()) return;
+#endif
         if (s_sdq_probe_stuck) return;   // one wedged probe is enough for this boot
         if (!s_sdq.mount_ms || millis() - s_sdq.mount_ms > 60 * 1000u) sdq_probe_spawn();
         return;

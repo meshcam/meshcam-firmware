@@ -11,7 +11,10 @@
  *   GPIO3   battery-divider ADC (ADC1_CH2)        (backlog)
  *   GPIO40/41  BME280 I2C SDA/SCL                 (backlog)
  *   GPIO39  spare
- *   47/48/38/14/1/2/42  SX1262 SPI + control      (radio layer, backlog)
+ *   47/48/38  microSD          — SPI on v0.x, SDMMC 1-bit on v1.0
+ *   14/2/1/42 radio control    — SX1262 NSS/BUSY/RST/DIO1 on v0.x; on the v1.0 PCB the
+ *                                same pins are RAK3172 UART TX / UART RX / NRST / BOOT0
+ *                                (respin spec §11). Selected by -DLORA_BACKEND_RAK3172.
  */
 
 // ---- camera (ESP32S3_EYE map) ----

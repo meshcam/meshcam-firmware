@@ -31,6 +31,11 @@ static volatile uint16_t  s_conn_handle = 0xFFFF;
 static volatile LeafBleCmd s_cmd    = LEAF_BLE_CMD_NONE;
 static char               s_name[24] = {0};
 static String             s_payload  = "{}";
+// AP credentials for the handoff, staged by leaf_ble_set_ap() and re-emitted by every
+// set_status(). Kept here rather than passed in on each status call because the counters
+// are refreshed ten times a second from the wake loop and the credentials never change.
+static char               s_ap[24]  = {0};
+static char               s_key[24] = {0};
 
 // --- callbacks -------------------------------------------------------------------------
 // Keep these SHORT. They run on the NimBLE host task; anything that blocks here stalls the
@@ -149,23 +154,49 @@ const char* leaf_ble_name() { return s_name; }
 void leaf_ble_set_status(const char* node, const char* fw, uint32_t boot_count,
                          uint32_t pir_wakes, uint32_t captures, uint32_t push_fails,
                          float vbat_v) {
-    char buf[192];
+    // 256, not 192: the counters are ~90 B and the AP name + key add ~45 B more. A read
+    // longer than the MTU pages over ATT_READ_BLOB, so length costs a round trip, not a
+    // truncation — but snprintf truncating the JSON mid-string would hand the app garbage
+    // it cannot parse, so the headroom is the part that matters.
+    char buf[256];
+    int n;
     if (isnan(vbat_v)) {
-        snprintf(buf, sizeof(buf),
-                 "{\"node\":\"%s\",\"fw\":\"%s\",\"boot\":%u,\"pir\":%u,\"cap\":%u,\"fail\":%u}",
+        n = snprintf(buf, sizeof(buf),
+                 "{\"node\":\"%s\",\"fw\":\"%s\",\"boot\":%u,\"pir\":%u,\"cap\":%u,\"fail\":%u",
                  node ? node : "?", fw ? fw : "?", (unsigned)boot_count,
                  (unsigned)pir_wakes, (unsigned)captures, (unsigned)push_fails);
     } else {
-        snprintf(buf, sizeof(buf),
+        n = snprintf(buf, sizeof(buf),
                  "{\"node\":\"%s\",\"fw\":\"%s\",\"boot\":%u,\"pir\":%u,\"cap\":%u,\"fail\":%u,"
-                 "\"vb\":%.2f}",
+                 "\"vb\":%.2f",
                  node ? node : "?", fw ? fw : "?", (unsigned)boot_count,
                  (unsigned)pir_wakes, (unsigned)captures, (unsigned)push_fails, vbat_v);
     }
+    // snprintf returns the length it WANTED, so n can run past the buffer. Clamp with room
+    // for the closing brace: a JSON object that ends mid-string is unparseable, whereas one
+    // that ends early but closed at least loses only the tail fields.
+    if (n < 0 || n > (int)sizeof(buf) - 2) n = sizeof(buf) - 2;
+    // Both or neither. An "ap" with no "key" strands the operator exactly as before, and
+    // the app treats the pair as the thing that makes its join card renderable.
+    if (s_ap[0] && s_key[0])
+        n += snprintf(buf + n, sizeof(buf) - n, ",\"ap\":\"%s\",\"key\":\"%s\"", s_ap, s_key);
+    if (n < 0 || n > (int)sizeof(buf) - 2) n = sizeof(buf) - 2;
+    snprintf(buf + n, sizeof(buf) - n, "}");
+
     s_payload = String(buf);
     if (s_status) {
         s_status->setValue(s_payload);
         if (s_conn) s_status->notify();
+    }
+}
+
+void leaf_ble_set_ap(const char* ssid, const char* psk) {
+    if (ssid && *ssid && psk && *psk) {
+        snprintf(s_ap,  sizeof(s_ap),  "%s", ssid);
+        snprintf(s_key, sizeof(s_key), "%s", psk);
+    } else {
+        s_ap[0] = 0;
+        s_key[0] = 0;
     }
 }
 
@@ -214,6 +245,8 @@ void leaf_ble_end(bool release_memory) {
     s_conn_handle = 0xFFFF;
     s_cmd         = LEAF_BLE_CMD_NONE;
     s_stopping    = false;
+    s_ap[0]       = 0;   // staged per window by the caller, not per boot
+    s_key[0]      = 0;
     Serial.printf("[ble] stack down (controller memory %s)\n",
                   release_memory ? "RELEASED - no restart this boot" : "kept, restartable");
 }

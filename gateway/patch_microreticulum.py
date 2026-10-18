@@ -422,3 +422,82 @@ if os.path.isfile(fstore):
         with open(fstore, "w") as f:
             f.write(fsrc)
         print("[patch_microreticulum] microStore threshold-compact fix patched (FileStore.h)")
+
+# Destination.cpp is the second patch target (Patch 6 below).
+dest = os.path.join(libdeps, "microReticulum", "src", "microReticulum", "Destination.cpp")
+
+# ---- Patch 6: Destination::receive's three silent exits (2026-09-04) --------------------
+# A command that is correctly addressed to this node but fails authentication is dropped
+# with ZERO output. Destination::receive stacks three silent exits — empty plaintext after
+# decrypt, non-DATA packet type, no registered callback — and during the downlink investigation the leaf ran
+# the full ~208 ms X25519 decrypt on every wake and binned the result, indistinguishable
+# from no packet at all. That produced two wrong hypotheses before the stale TOFU pin was
+# found (homelab docs/trailcam/board-test-log.md, "2026-09-03: root cause").
+#
+# Anything reaching this point was ADDRESSED TO US: a frame for someone else is rejected on
+# its address in ~1 ms, before any crypto. So a failure here is always worth a line.
+#
+# NOTICE, not DEBUG, and that is deliberate. Two gates suppress DEBUG:
+#   * compile time — the leaf sets no RNS_LOG_LEVEL, so Log.h defaults the ceiling to
+#     VERBOSE(6) and every DEBUG(7) macro compiles to ((void)0). A DEBUG line would emit
+#     literally nothing on the exact device the bead is about.
+#   * runtime — the gateway compiles at RNS_LOG_LEVEL=7 but calls RNS::loglevel(LOG_NOTICE)
+#     in main.cpp, and only NOTICE+ is mirrored into its /debuglog ring.
+# NOTICE is the only level visible on both, and it is the level the gateway's own bug-6
+# silent-drop patch already chose for the same reason.
+#
+# Flood risk is nil. Transport::inbound reaches Destination::receive from exactly two
+# call sites: the LINKREQUEST branch (handled above these exits) and the DATA branch, which
+# is already inside `packet.packet_type() == Type::Packet::DATA`. So the non-DATA exit is
+# unreachable in this firmware and the no-callback exit only fires if a destination was
+# built without set_packet_callback — both are "cannot happen", logged so that a future
+# refactor that makes them happen says so out loud. Only the decrypt exit fires in practice,
+# and only when something is genuinely wrong.
+if os.path.isfile(dest):
+    with open(dest) as f:
+        dsrc = f.read()
+    if "PATCHED (2026-09-04)" in dsrc:
+        print("[patch_microreticulum] Destination::receive silent exits already patched")
+    else:
+        RECV_OLD = (
+            "\t\tBytes plaintext(decrypt(packet.data()));\n"
+            "\t\t//TRACEF(\"Destination::receive: decrypted data: %s\", plaintext.toHex().c_str());\n"
+            "\t\tif (plaintext) {\n"
+        )
+        RECV_NEW = (
+            "\t\tBytes plaintext(decrypt(packet.data()));\n"
+            "\t\t//TRACEF(\"Destination::receive: decrypted data: %s\", plaintext.toHex().c_str());\n"
+            "\t\t// PATCHED (2026-09-04): name every silent exit below. A packet\n"
+            "\t\t// that got this far was ADDRESSED TO US and has already paid the full X25519\n"
+            "\t\t// decrypt (~208 ms on an ESP32-S3); dropping it with no output made a stale TOFU\n"
+            "\t\t// pin indistinguishable from no packet at all and cost a day to find. NOTICE and\n"
+            "\t\t// not DEBUG because DEBUG is compiled out on the leaf (default RNS_LOG_LEVEL\n"
+            "\t\t// ceiling is VERBOSE) and suppressed at runtime on the gateway (LOG_NOTICE).\n"
+            "\t\tif (!plaintext) {\n"
+            "\t\t\tNOTICEF(\"Destination::receive: DECRYPT FAILED for %s (%u ciphertext bytes) - \"\n"
+            "\t\t\t        \"addressed to us but did not authenticate; the sender is encrypting to \"\n"
+            "\t\t\t        \"a key we no longer hold (stale TOFU pin, regenerated identity, or a \"\n"
+            "\t\t\t        \"ratchet we lost)\", toString().c_str(), (unsigned)packet.data().size());\n"
+            "\t\t}\n"
+            "\t\telse if (packet.packet_type() != Type::Packet::DATA) {\n"
+            "\t\t\tNOTICEF(\"Destination::receive: decrypted OK for %s but packet type %d is not \"\n"
+            "\t\t\t        \"DATA - dropped\", toString().c_str(), (int)packet.packet_type());\n"
+            "\t\t}\n"
+            "\t\telse if (!_object->_callbacks._packet) {\n"
+            "\t\t\tNOTICEF(\"Destination::receive: decrypted OK for %s (%u bytes) but NO packet \"\n"
+            "\t\t\t        \"callback is registered - dropped\", toString().c_str(),\n"
+            "\t\t\t        (unsigned)plaintext.size());\n"
+            "\t\t}\n"
+            "\t\tif (plaintext) {\n"
+        )
+        if dsrc.count(RECV_OLD) != 1:
+            raise SystemExit(
+                "[patch_microreticulum] Destination::receive decrypt block not found uniquely "
+                "in %s (found %d) - upstream changed, re-derive the patch"
+                % (dest, dsrc.count(RECV_OLD)))
+        dsrc = dsrc.replace(RECV_OLD, RECV_NEW)
+        with open(dest, "w") as f:
+            f.write(dsrc)
+        print("[patch_microreticulum] Destination::receive silent exits patched (3 sites)")
+else:
+    print("[patch_microreticulum] %s not present yet - run pio again" % dest)

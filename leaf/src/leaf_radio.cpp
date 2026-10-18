@@ -12,6 +12,8 @@
 
 #include "leaf_serial_proto.h"      // tc_node_slug / tc_set_node_slug (wire identity)
 #include "leaf_store.h"            // store state rides the announce tail
+#include "leaf_identity.h"         // notice + report an identity change
+#include "leaf_nvs.h"              // the durable NVS partition the identity lives in
 
 // --- persistent RNS objects (rebuilt each boot; identity is the stable part) ----------
 static RNS::Reticulum reticulum({RNS::Type::NONE});
@@ -61,40 +63,62 @@ bool leaf_radio_had_contact() { return s_contact; }
 static const char* APP_NAME = "trailcam";
 static const char* ASPECT   = "leaf";
 
-// NVS-backed identity: the private key survives deep sleep AND power loss.
+// NVS-backed identity: the private key survives deep sleep AND power loss — and, since
+// leaf-0.23.0, a full `write-flash 0x0` and an NVS-full auto-erase too, because it lives
+// in the durable `id` partition rather than the default one (leaf_nvs.h).
 static const char* NVS_NS  = "leaf";
 static const char* NVS_KEY = "rns_prv";
+
+// Open the identity namespace wherever this board can keep it. Boards flashed with a
+// pre-0.23.0 partition table have no `id` partition, and must still boot.
+static bool open_identity_store(Preferences& p, bool read_only) {
+    if (leaf_nvs_durable_available())
+        return p.begin(NVS_NS, read_only, LEAF_NVS_DURABLE);
+    return p.begin(NVS_NS, read_only);
+}
 
 // --- inbound packets (gateway -> leaf commands) --------------------------------------
 static void on_packet(const RNS::Bytes& data, const RNS::Packet& /*packet*/) {
     s_contact = true;   // any packet addressed to us = the gateway hears us
+    // Downlink probe: if THIS fires instead of on_mesh_cmd_packet, the stub won the
+    // set_packet_callback race and commands are being thrown away by design.
+    Serial.printf("[cmd-probe] STUB t=%lu %u bytes -- stub callback won the registration\n",
+                  (unsigned long)millis(), (unsigned)data.size());
     Serial.printf("[radio] RX packet: %u bytes -> (stub) would parse gateway command\n",
                   (unsigned)data.size());
     // TODO(command): parse "send hi-res of image N" / schedule update / time sync.
 }
 
-static RNS::Identity load_or_create_identity() {
+// out_minted: true when NVS held no usable key and one had to be generated. The caller
+// hands that to the identity witness — "NVS came up empty" is the difference between a
+// board that has never run and a board that just lost its identity.
+static RNS::Identity load_or_create_identity(bool* out_minted) {
+    if (out_minted) *out_minted = false;
+    uint8_t buf[128];
     Preferences p;
-    p.begin(NVS_NS, /*readOnly=*/false);
+    open_identity_store(p, /*read_only=*/false);
     size_t n = p.getBytesLength(NVS_KEY);
-    if (n > 0 && n <= 128) {
-        uint8_t buf[128];
-        p.getBytes(NVS_KEY, buf, n);
-        p.end();
+    if (n > sizeof(buf)) n = 0;
+    if (n > 0) p.getBytes(NVS_KEY, buf, n);
+    p.end();
+    // Nothing here means nothing anywhere: leaf_nvs_migrate_durable() ran in setup(),
+    // so a key that predated the `id` partition has already been moved across by now.
+    // That ordering is the reason a partition-table change does not cost the fleet its
+    // names.
+    if (n > 0) {
         RNS::Identity id(false);                    // empty, no keys yet
         if (id.load_private_key(RNS::Bytes(buf, n))) {
             Serial.printf("[radio] identity loaded from NVS (%u key bytes)\n", (unsigned)n);
             return id;
         }
         Serial.println("[radio] NVS key load FAILED -> regenerating");
-    } else {
-        p.end();
     }
     // Cold boot (or unusable stored key): mint once, persist forever.
+    if (out_minted) *out_minted = true;
     RNS::Identity id(true);
     RNS::Bytes prv = id.get_private_key();
     Preferences pw;
-    pw.begin(NVS_NS, false);
+    open_identity_store(pw, false);
     pw.putBytes(NVS_KEY, prv.data(), prv.size());
     pw.end();
     Serial.printf("[radio] identity CREATED + stored to NVS (%u key bytes)\n",
@@ -111,7 +135,8 @@ bool leaf_radio_begin() {
     RNS::Utilities::OS::register_filesystem(filesystem);
 
     // 2. Persistent identity + the leaf's stable IN destination.
-    identity    = load_or_create_identity();
+    bool minted = false;
+    identity    = load_or_create_identity(&minted);
     destination = RNS::Destination(identity, RNS::Type::Destination::IN,
                                    RNS::Type::Destination::SINGLE, APP_NAME, ASPECT);
     destination.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);
@@ -127,11 +152,18 @@ bool leaf_radio_begin() {
         snprintf(derived, sizeof(derived), "leaf-%.8s", destination.hash().toHex().c_str());
         tc_set_node_slug(derived);
         Serial.printf("[radio] wire identity: %s\n", tc_node_slug());
+        // Did that identity change since the last boot? The witness lives on LittleFS,
+        // which no reflash of the bootloader/partition-table/otadata/app touches and the
+        // combined factory image does not reach either — so it outlives the NVS key it
+        // describes, which is the whole point.
+        leaf_identity_witness(tc_node_slug(), destination.hash().toHex().c_str(), minted);
     }
 
-    // 3. SX1262 bring-up (same config proven in gate-b). start() returns false if the
-    //    radio doesn't answer (e.g. antenna/BUSY issue); we keep RNS up regardless so the
-    //    identity/destination are still valid, but no packets go out.
+    // 3. Radio bring-up. Which PHY that is depends on the board: a bare SX1262 on SPI
+    //    (v0.x, config proven in gate-b) or a RAK3172-T AT modem on UART (v1.0), chosen
+    //    by -DLORA_BACKEND_RAK3172 inside LoRaInterface. start() returns false if the
+    //    radio doesn't answer (antenna/BUSY on one, rail/UART/NRST on the other); we keep
+    //    RNS up regardless so the identity/destination are still valid, but nothing goes out.
     lora_interface = new LoRaInterface();
     // Apply any staged (RTC-persisted) ADR grant BEFORE start() so this whole wake —
     // announce included — runs on the granted profile. The ctor registered itself as
@@ -145,7 +177,12 @@ bool leaf_radio_begin() {
     lora_interface.mode(RNS::Type::Interface::MODE_GATEWAY);  // relays; power-mode tuning TBD
     RNS::Transport::register_interface(lora_interface);
     s_radio = lora_interface.start();
-    Serial.printf("[radio] SX1262 init %s\n", s_radio ? "OK" : "FAILED (RNS up, no TX/RX)");
+#ifdef LORA_BACKEND_RAK3172
+    const char* phy = "RAK3172";
+#else
+    const char* phy = "SX1262";
+#endif
+    Serial.printf("[radio] %s init %s\n", phy, s_radio ? "OK" : "FAILED (RNS up, no TX/RX)");
 
     // 4. Reticulum transport.
     reticulum = RNS::Reticulum();
@@ -212,6 +249,18 @@ void leaf_radio_announce(const char* status) {
             n += snprintf(ad + n, sizeof(ad) - n, "%s%lu", i ? "," : "",
                           (unsigned long)s_ack_ids[i]);
         s_ack_n = 0;   // one announce carries them; the server ack is idempotent anyway
+    }
+    // Identity-change alarm: "x=<the slug this board used to announce under>".
+    // LAST in the tail on purpose — the acks above are one-shot and this repeats, so if
+    // anything gets truncated it should be this. Bounded to a burst per power cycle
+    // (leaf_identity.h); absent on a healthy node, so its presence alone is the alarm.
+    if (leaf_identity_alarm_pending() && n > 0 && n < (int)sizeof(ad)) {
+        const int room = (int)sizeof(ad) - n;
+        const int want = snprintf(nullptr, 0, " x=%s", leaf_identity_prev_slug());
+        if (want < room) {
+            n += snprintf(ad + n, room, " x=%s", leaf_identity_prev_slug());
+            leaf_identity_alarm_sent();   // only spend the budget on a token that fit
+        }
     }
     RNS::Bytes app_data(ad);
     destination.announce(app_data);
@@ -522,8 +571,19 @@ static int  s_mesh_cmd_count = 0;
 
 static void on_mesh_cmd_packet(const RNS::Bytes& data, const RNS::Packet& /*packet*/) {
     s_contact = true;   // a packet addressed to us = the gateway hears our announces
-    if (data.size() < 8 || data.size() >= 768) return;
-    if (s_mesh_cmd_count >= MESH_CMD_SLOTS) return;
+    // Downlink probe: log on ENTRY, ahead of both guards below. They return silently, so
+    // a command arriving at the wrong size used to vanish without a trace.
+    Serial.printf("[cmd-probe] ENTER t=%lu %u bytes\n",
+                  (unsigned long)millis(), (unsigned)data.size());
+    if (data.size() < 8 || data.size() >= 768) {
+        Serial.printf("[cmd-probe] DROP size guard (%u bytes, want 8..767)\n",
+                      (unsigned)data.size());
+        return;
+    }
+    if (s_mesh_cmd_count >= MESH_CMD_SLOTS) {
+        Serial.printf("[cmd-probe] DROP slots full (%d)\n", s_mesh_cmd_count);
+        return;
+    }
     memcpy(s_mesh_cmds[s_mesh_cmd_count], data.data(), data.size());
     s_mesh_cmds[s_mesh_cmd_count][data.size()] = 0;
     s_mesh_cmd_count++;
@@ -546,7 +606,14 @@ void leaf_radio_poll_commands(uint32_t ms, tc_cmd_handler handler) {
     if (!leaf_radio_begin()) return;
     s_mesh_cmd_count = 0;
     destination.set_packet_callback(on_mesh_cmd_packet);
+    // Downlink probe: bracket the window. A gateway "[cmd-probe] TX" outside this pair is
+    // the outside-the-window case; inside it with no ENTER is an addressing/decrypt loss.
+    const uint32_t t_open = millis();
+    Serial.printf("[cmd-probe] WINDOW OPEN t=%lu for %lums\n",
+                  (unsigned long)t_open, (unsigned long)ms);
     leaf_radio_rx_window(ms);
+    Serial.printf("[cmd-probe] WINDOW CLOSE t=%lu got=%d\n",
+                  (unsigned long)millis(), s_mesh_cmd_count);
     // Receipt acks FIRST (bug 8): stage the server ids we just received and announce
     // them before executing anything — receipt is not completion, and a fetch_full
     // handler can hold the wake for minutes. The gateway hears the announce and flips

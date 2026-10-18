@@ -7,6 +7,10 @@
 #include "esp_system.h"         // esp_random (per-boot event-id salt)
 #include "mbedtls/base64.h"
 
+#ifdef LEAF_RADIO
+#include "leaf_identity.h"      // prev_node in telemetry when the identity changed
+#endif
+
 // Wire identity. Default (empty) = derived at radio init: "leaf-" + the first 8 hex of
 // the RNS destination hash (homelab docs/trailcam/node-identity.md — firmware transmits
 // a machine id, human names live only in the app). A non-empty LEAF_NODE_SLUG build flag
@@ -76,6 +80,14 @@ void tc_emit_telemetry(const LeafTelemetry& t) {
     if (t.rssi != INT32_MIN)    o += snprintf(j + o, sizeof(j) - o, ",\"rssi\":%ld", (long)t.rssi);
     if (!isnan(t.snr))          o += snprintf(j + o, sizeof(j) - o, ",\"snr\":%.1f", t.snr);
     if (t.boot_reason)          o += snprintf(j + o, sizeof(j) - o, ",\"boot_reason\":\"%s\"", t.boot_reason);
+#ifdef LEAF_RADIO
+    // Identity change: the slug this board announced under before it lost its
+    // NVS key. Absent on a healthy node. The server needs it to merge the split history
+    // back onto one camera row, and a human needs it to know a merge is owed at all.
+    if (const char* prev = leaf_identity_prev_slug())
+        o += snprintf(j + o, sizeof(j) - o, ",\"prev_node\":\"%s\",\"identity_gen\":%lu",
+                      prev, (unsigned long)leaf_identity_generation());
+#endif
     snprintf(j + o, sizeof(j) - o, ",\"fw_version\":\"%s\"}", LEAF_FW_VERSION);
     Serial.printf("!TC TLM %s\n", j);
 }
